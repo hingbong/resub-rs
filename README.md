@@ -6,6 +6,12 @@
 是「U2字幕重命名工具 1.0 Final」（.NET 2.0 WinForms）的替代实现，并额外支持把
 Matroska 里的内嵌 ASS/SSA 抽成独立文件。
 
+## 下载
+
+Windows 直接下 [nightly release](https://github.com/hingbong/resub-rs/releases/tag/nightly) 里的
+`resub.exe`，每次 push 到 main 自动重新构建并覆盖同一个 release。
+双击即用，不需要安装任何运行时。
+
 ## 构建
 
 只需要 [Rust](https://rustup.rs)：
