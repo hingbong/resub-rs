@@ -40,7 +40,8 @@ cargo build --release --no-default-features   # 纯 CLI，体积更小，不依�
 resub gui
 ```
 
-原生窗口，界面与逻辑在同一个进程里。
+原生窗口，界面与逻辑在同一个进程里。选目录用的是系统原生对话框，
+NAS 的映射盘符、UNC 路径和网络邻居都能直接选到。
 
 ### 命令行
 

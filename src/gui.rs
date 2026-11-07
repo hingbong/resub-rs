@@ -1,7 +1,7 @@
 //! Native window front-end (eframe/egui). Everything is compiled into the executable:
 //! no browser, no server, no runtime to install.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use eframe::egui;
@@ -116,47 +116,41 @@ pub fn run() -> eframe::Result {
     )
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Target {
-    Videos,
-    Subs,
-    Mkv,
-    Out,
+/// Native folder picker. This is the OS dialog, so mapped drives, UNC paths and the
+/// Network neighbourhood are all reachable - which the in-app browser could not do.
+fn pick_folder(title: &str, current: &str) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_title(title);
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        let p = Path::new(trimmed);
+        if p.is_dir() {
+            dialog = dialog.set_directory(p);
+        } else if let Some(parent) = p.parent() {
+            if parent.is_dir() {
+                dialog = dialog.set_directory(parent);
+            }
+        }
+    }
+    dialog.pick_folder()
 }
 
-struct Picker {
-    target: Target,
-    want_file: bool,
-    path: String,
-    parent: Option<String>,
-    dirs: Vec<String>,
-    files: Vec<String>,
-    error: Option<String>,
-}
-
-impl Picker {
-    fn new(target: Target, want_file: bool, start: String) -> Self {
-        let mut p = Picker {
-            target,
-            want_file,
-            path: String::new(),
-            parent: None,
-            dirs: Vec::new(),
-            files: Vec::new(),
-            error: None,
-        };
-        p.load(&start);
-        p
+fn pick_file(title: &str, current: &str) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new()
+        .set_title(title)
+        .add_filter("Matroska", &["mkv"])
+        .add_filter("视频", &["mkv", "mp4", "m2ts", "ts", "avi"]);
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        let p = Path::new(trimmed);
+        if p.is_dir() {
+            dialog = dialog.set_directory(p);
+        } else if let Some(parent) = p.parent() {
+            if parent.is_dir() {
+                dialog = dialog.set_directory(parent);
+            }
+        }
     }
-
-    fn load(&mut self, path: &str) {
-        let listing = crate::list_dir(path, self.want_file);
-        self.path = listing.path;
-        self.parent = listing.parent;
-        self.dirs = listing.dirs;
-        self.files = listing.files;
-        self.error = listing.error;
-    }
+    dialog.pick_file()
 }
 
 /// Messages from the extraction worker thread.
@@ -180,7 +174,6 @@ struct App {
     extract_progress: String,
     extract_tracks: Vec<crate::ExtractedTrack>,
     extract_errors: Vec<String>,
-    picker: Option<Picker>,
 }
 
 impl Default for App {
@@ -198,7 +191,6 @@ impl Default for App {
             extract_progress: String::new(),
             extract_tracks: Vec::new(),
             extract_errors: Vec::new(),
-            picker: None,
         }
     }
 }
@@ -217,11 +209,11 @@ fn basename(p: &str) -> &str {
     p.rsplit(['/', '\\']).next().unwrap_or(p)
 }
 
-impl App {
-    fn open_picker(&mut self, target: Target, want_file: bool, start: String) {
-        self.picker = Some(Picker::new(target, want_file, start));
-    }
+fn as_string(p: PathBuf) -> String {
+    p.to_string_lossy().to_string()
+}
 
+impl App {
     fn preview(&mut self) {
         self.plan = None;
         self.message.clear();
@@ -385,8 +377,9 @@ impl App {
                         .hint_text("包含视频文件的目录"),
                 );
                 if ui.button("浏览").clicked() {
-                    let start = self.videos.clone();
-                    self.open_picker(Target::Videos, false, start);
+                    if let Some(p) = pick_folder("选择视频目录", &self.videos) {
+                        self.videos = as_string(p);
+                    }
                 }
                 ui.end_row();
 
@@ -397,14 +390,18 @@ impl App {
                         .hint_text("包含字幕文件的目录"),
                 );
                 if ui.button("浏览").clicked() {
-                    let start = self.subs.clone();
-                    self.open_picker(Target::Subs, false, start);
+                    if let Some(p) = pick_folder("选择字幕目录", &self.subs) {
+                        self.subs = as_string(p);
+                    }
                 }
                 ui.end_row();
 
                 ui.label("后缀");
                 ui.horizontal(|ui| {
-                    ui.add_sized([90.0, ui.spacing().interact_size.y], egui::TextEdit::singleline(&mut self.suffix));
+                    ui.add_sized(
+                        [90.0, ui.spacing().interact_size.y],
+                        egui::TextEdit::singleline(&mut self.suffix),
+                    );
                     ui.label("字幕名里已带 .sc / .tc / .SumiSora 等标记时会沿用原名里的");
                 });
                 ui.label("");
@@ -495,10 +492,18 @@ impl App {
                     egui::TextEdit::singleline(&mut self.mkv)
                         .hint_text("单个 .mkv，或包含 MKV 的目录（会递归）"),
                 );
-                if ui.button("浏览").clicked() {
-                    let start = self.mkv.clone();
-                    self.open_picker(Target::Mkv, true, start);
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("选文件").clicked() {
+                        if let Some(p) = pick_file("选择 MKV 文件", &self.mkv) {
+                            self.mkv = as_string(p);
+                        }
+                    }
+                    if ui.button("选目录").clicked() {
+                        if let Some(p) = pick_folder("选择包含 MKV 的目录", &self.mkv) {
+                            self.mkv = as_string(p);
+                        }
+                    }
+                });
                 ui.end_row();
 
                 ui.label("输出目录");
@@ -508,18 +513,16 @@ impl App {
                         .hint_text("留空 = 每个 MKV 旁边"),
                 );
                 if ui.button("浏览").clicked() {
-                    let start = self.out.clone();
-                    self.open_picker(Target::Out, false, start);
+                    if let Some(p) = pick_folder("选择输出目录", &self.out) {
+                        self.out = as_string(p);
+                    }
                 }
                 ui.end_row();
             });
 
         let busy = self.extract_rx.is_some();
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!busy, egui::Button::new("抽取"))
-                .clicked()
-            {
+            if ui.add_enabled(!busy, egui::Button::new("抽取")).clicked() {
                 let ctx = ui.ctx().clone();
                 self.start_extract(ctx);
             }
@@ -568,88 +571,6 @@ impl App {
                 });
         }
     }
-
-    fn show_picker(&mut self, ctx: &egui::Context) {
-        let Some(mut picker) = self.picker.take() else {
-            return;
-        };
-        let mut open = true;
-        let mut chosen: Option<String> = None;
-        let mut nav: Option<String> = None;
-
-        egui::Window::new("选择路径")
-            .collapsible(false)
-            .resizable(true)
-            .default_width(620.0)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label(if picker.path.is_empty() {
-                    "(根目录)"
-                } else {
-                    picker.path.as_str()
-                });
-                if let Some(err) = &picker.error {
-                    ui.colored_label(egui::Color32::from_rgb(200, 60, 60), err);
-                }
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .id_salt("picker_scroll")
-                    .max_height(340.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if let Some(parent) = picker.parent.clone() {
-                            if ui.button("..").clicked() {
-                                nav = Some(parent);
-                            }
-                        }
-                        for d in &picker.dirs {
-                            if ui.button(format!("[目录] {d}")).clicked() {
-                                nav = Some(join_path(&picker.path, d));
-                            }
-                        }
-                        for f in &picker.files {
-                            if ui.button(f).clicked() {
-                                nav = Some(join_path(&picker.path, f));
-                            }
-                        }
-                    });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("选择此目录").clicked() {
-                        chosen = Some(picker.path.clone());
-                    }
-                    if picker.want_file {
-                        ui.label("点击文件名即可选中该文件");
-                    }
-                });
-            });
-
-        if let Some(p) = nav {
-            picker.load(&p);
-        }
-        if let Some(path) = chosen {
-            match picker.target {
-                Target::Videos => self.videos = path,
-                Target::Subs => self.subs = path,
-                Target::Mkv => self.mkv = path,
-                Target::Out => self.out = path,
-            }
-            return;
-        }
-        if open {
-            self.picker = Some(picker);
-        }
-    }
-}
-
-fn join_path(base: &str, name: &str) -> String {
-    if base.is_empty() {
-        name.to_string()
-    } else if base.ends_with('/') || base.ends_with('\\') {
-        format!("{base}{name}")
-    } else {
-        format!("{base}/{name}")
-    }
 }
 
 impl eframe::App for App {
@@ -673,6 +594,5 @@ impl eframe::App for App {
                     ui.add_space(14.0);
                 });
         });
-        self.show_picker(&ctx);
     }
 }

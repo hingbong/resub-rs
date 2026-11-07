@@ -15,7 +15,7 @@ path = "src/main.rs"
 [features]
 default = ["gui"]
 # Native window front-end. Build with --no-default-features for a CLI/browser-only binary.
-gui = ["dep:eframe"]
+gui = ["dep:eframe", "dep:rfd"]
 
 [dependencies]
 eframe = { version = "0.37", optional = true, default-features = false, features = [
@@ -27,6 +27,7 @@ eframe = { version = "0.37", optional = true, default-features = false, features
     "x11",
 ] }
 flate2 = "1"
+rfd = { version = "0.17", optional = true, default-features = false, features = ["xdg-portal"] }
 regex = "1"
 walkdir = "2"
 tiny_http = "0.12"
