@@ -379,9 +379,9 @@ impl App {
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
                 ui.label("视频目录");
-                ui.add(
+                ui.add_sized(
+                    [560.0, ui.spacing().interact_size.y],
                     egui::TextEdit::singleline(&mut self.videos)
-                        .desired_width(560.0)
                         .hint_text("包含视频文件的目录"),
                 );
                 if ui.button("浏览").clicked() {
@@ -391,9 +391,9 @@ impl App {
                 ui.end_row();
 
                 ui.label("字幕目录");
-                ui.add(
+                ui.add_sized(
+                    [560.0, ui.spacing().interact_size.y],
                     egui::TextEdit::singleline(&mut self.subs)
-                        .desired_width(560.0)
                         .hint_text("包含字幕文件的目录"),
                 );
                 if ui.button("浏览").clicked() {
@@ -404,7 +404,7 @@ impl App {
 
                 ui.label("后缀");
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.suffix).desired_width(90.0));
+                    ui.add_sized([90.0, ui.spacing().interact_size.y], egui::TextEdit::singleline(&mut self.suffix));
                     ui.label("字幕名里已带 .sc / .tc / .SumiSora 等标记时会沿用原名里的");
                 });
                 ui.label("");
@@ -490,9 +490,9 @@ impl App {
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
                 ui.label("输入");
-                ui.add(
+                ui.add_sized(
+                    [560.0, ui.spacing().interact_size.y],
                     egui::TextEdit::singleline(&mut self.mkv)
-                        .desired_width(560.0)
                         .hint_text("单个 .mkv，或包含 MKV 的目录（会递归）"),
                 );
                 if ui.button("浏览").clicked() {
@@ -502,9 +502,9 @@ impl App {
                 ui.end_row();
 
                 ui.label("输出目录");
-                ui.add(
+                ui.add_sized(
+                    [560.0, ui.spacing().interact_size.y],
                     egui::TextEdit::singleline(&mut self.out)
-                        .desired_width(560.0)
                         .hint_text("留空 = 每个 MKV 旁边"),
                 );
                 if ui.button("浏览").clicked() {

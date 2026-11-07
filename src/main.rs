@@ -3,9 +3,48 @@ use std::process::ExitCode;
 
 use resub::rename::{self, Mode, Status};
 
+/// Console plumbing for the double-click case. The binary is a console app so the CLI
+/// keeps working, but Explorer launching it should not leave a black window behind.
+#[cfg(windows)]
+mod console {
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleWindow() -> *mut c_void;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn ShowWindow(hwnd: *mut c_void, cmd: i32) -> i32;
+        fn MessageBoxW(hwnd: *mut c_void, text: *const u16, caption: *const u16, utype: u32) -> i32;
+    }
+
+    pub fn hide() {
+        unsafe {
+            let hwnd = GetConsoleWindow();
+            if !hwnd.is_null() {
+                ShowWindow(hwnd, 0);
+            }
+        }
+    }
+
+    /// A GUI that fails to open before any window exists would vanish silently.
+    pub fn error_box(title: &str, text: &str) {
+        let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+        let t = wide(text);
+        let c = wide(title);
+        unsafe {
+            MessageBoxW(std::ptr::null_mut(), t.as_ptr(), c.as_ptr(), 0x10);
+        }
+    }
+}
+
 fn usage() {
     println!(
         "resub - 字幕批量改名 / MKV 内嵌字幕抽取
+
+双击 resub.exe 直接打开界面；也可以从命令行使用：
 
 用法:
   resub extract <文件或目录> [--out 目录] [--track 轨道号]
@@ -50,6 +89,22 @@ fn opt<'a>(named: &'a [(String, String)], key: &str) -> Option<&'a str> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Launched from Explorer (no arguments): open the window instead of printing usage.
+    if args.is_empty() {
+        #[cfg(feature = "gui")]
+        {
+            #[cfg(windows)]
+            console::hide();
+            return cmd_gui(&[]);
+        }
+        #[cfg(not(feature = "gui"))]
+        {
+            usage();
+            return ExitCode::SUCCESS;
+        }
+    }
+
     let Some(cmd) = args.first().map(String::as_str) else {
         usage();
         return ExitCode::SUCCESS;
@@ -79,6 +134,8 @@ fn cmd_gui(_named: &[(String, String)]) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("界面启动失败: {e}");
+            #[cfg(windows)]
+            console::error_box("resub 无法启动界面", &e.to_string());
             ExitCode::FAILURE
         }
     }
