@@ -221,8 +221,24 @@ fn handle_extract(body: &str) -> Value {
     } else {
         PathBuf::from(req.out.trim())
     };
-    match crate::extract_all(&file, &out) {
-        Ok(tracks) => json!({ "tracks": tracks, "out": out.to_string_lossy() }),
-        Err(e) => json!({ "error": e.to_string() }),
+    let files = crate::collect_mkv(&file);
+    if files.is_empty() {
+        return json!({ "error": format!("没有找到 .mkv 文件: {}", file.display()) });
     }
+    let mut all = Vec::new();
+    let mut errors = Vec::new();
+    for f in &files {
+        let dir = if req.out.trim().is_empty() {
+            f.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."))
+        } else {
+            PathBuf::from(req.out.trim())
+        };
+        match crate::extract_all(f, &dir, None) {
+            Ok(mut t) => all.append(&mut t),
+            Err(e) => errors.push(format!("{}: {e}", f.display())),
+        }
+    }
+    json!({ "tracks": all, "out": out.to_string_lossy(), "errors": errors })
 }

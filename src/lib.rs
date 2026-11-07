@@ -11,6 +11,7 @@ pub mod server;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use walkdir::WalkDir;
 
 /// A directory listing shared by the native window and the browser UI.
 pub struct DirListing {
@@ -109,6 +110,31 @@ pub fn list_dir(raw: &str, want_file: bool) -> DirListing {
     }
 }
 
+/// Every Matroska file under a path. A single file is returned as-is so the CLI and
+/// the UI can treat "one file" and "a folder" the same way.
+pub fn collect_mkv(path: &Path) -> Vec<PathBuf> {
+    if path.is_file() {
+        return vec![path.to_path_buf()];
+    }
+    if !path.is_dir() {
+        return Vec::new();
+    }
+    let mut out: Vec<PathBuf> = WalkDir::new(path)
+        .max_depth(5)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_path_buf())
+        .filter(|p| {
+            p.extension()
+                .map(|e| e.eq_ignore_ascii_case("mkv"))
+                .unwrap_or(false)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ExtractedTrack {
     pub number: u64,
@@ -120,8 +146,13 @@ pub struct ExtractedTrack {
     pub file: String,
 }
 
-/// Extract every text subtitle track of an MKV into separate .ass/.srt files.
-pub fn extract_all(mkv: &Path, out_dir: &Path) -> std::io::Result<Vec<ExtractedTrack>> {
+/// Extract the text subtitle tracks of one MKV into separate .ass/.srt files.
+/// Passing a track number restricts the work to that one track.
+pub fn extract_all(
+    mkv: &Path,
+    out_dir: &Path,
+    only: Option<u64>,
+) -> std::io::Result<Vec<ExtractedTrack>> {
     std::fs::create_dir_all(out_dir)?;
     let tracks = mkv::read_subtitles(mkv)?;
     let stem = mkv
@@ -133,6 +164,11 @@ pub fn extract_all(mkv: &Path, out_dir: &Path) -> std::io::Result<Vec<ExtractedT
     for t in &tracks {
         if t.events.is_empty() {
             continue;
+        }
+        if let Some(number) = only {
+            if t.info.number != number {
+                continue;
+            }
         }
         let tag = ass::language_tag(t);
         let ext = ass::file_extension(t);

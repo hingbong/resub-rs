@@ -2,6 +2,7 @@
 //! no browser, no server, no runtime to install.
 
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use eframe::egui;
 use walkdir::WalkDir;
@@ -158,6 +159,14 @@ impl Picker {
     }
 }
 
+/// Messages from the extraction worker thread.
+enum Msg {
+    Progress { done: usize, total: usize, file: String },
+    Tracks(Vec<crate::ExtractedTrack>),
+    Error(String),
+    Finished,
+}
+
 struct App {
     videos: String,
     subs: String,
@@ -167,9 +176,11 @@ struct App {
     message: String,
     mkv: String,
     out: String,
-    extract: Option<(String, Vec<crate::ExtractedTrack>)>,
+    extract_rx: Option<Receiver<Msg>>,
+    extract_progress: String,
+    extract_tracks: Vec<crate::ExtractedTrack>,
+    extract_errors: Vec<String>,
     picker: Option<Picker>,
-    initialized: bool,
 }
 
 impl Default for App {
@@ -183,9 +194,11 @@ impl Default for App {
             message: String::new(),
             mkv: String::new(),
             out: String::new(),
-            extract: None,
+            extract_rx: None,
+            extract_progress: String::new(),
+            extract_tracks: Vec::new(),
+            extract_errors: Vec::new(),
             picker: None,
-            initialized: false,
         }
     }
 }
@@ -212,8 +225,8 @@ impl App {
     fn preview(&mut self) {
         self.plan = None;
         self.message.clear();
-        let videos_dir = std::path::PathBuf::from(self.videos.trim());
-        let subs_dir = std::path::PathBuf::from(self.subs.trim());
+        let videos_dir = PathBuf::from(self.videos.trim());
+        let subs_dir = PathBuf::from(self.subs.trim());
         if !videos_dir.is_dir() {
             self.message = format!("视频目录不存在: {}", videos_dir.display());
             return;
@@ -262,27 +275,99 @@ impl App {
         };
     }
 
-    fn run_extract(&mut self) {
-        self.extract = None;
-        let file = std::path::PathBuf::from(self.mkv.trim());
-        if !file.is_file() {
-            self.message = format!("文件不存在: {}", file.display());
+    /// Extraction runs on a worker thread: a folder of MKVs takes seconds to minutes
+    /// and would otherwise freeze the window.
+    fn start_extract(&mut self, ctx: egui::Context) {
+        if self.extract_rx.is_some() {
             return;
         }
-        let out = if self.out.trim().is_empty() {
-            file.parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-        } else {
-            std::path::PathBuf::from(self.out.trim())
-        };
-        match crate::extract_all(&file, &out) {
-            Ok(tracks) => {
-                let n = tracks.len();
-                self.extract = Some((out.to_string_lossy().to_string(), tracks));
-                self.message = format!("抽出 {n} 条字幕轨道");
+        let raw = self.mkv.trim().to_string();
+        let out = self.out.trim().to_string();
+        let path = PathBuf::from(&raw);
+        if !path.exists() {
+            self.extract_progress = format!("路径不存在: {raw}");
+            return;
+        }
+        let files = crate::collect_mkv(&path);
+        if files.is_empty() {
+            self.extract_progress = format!("在 {raw} 里没有找到 .mkv 文件");
+            return;
+        }
+        let total = files.len();
+        self.extract_tracks.clear();
+        self.extract_errors.clear();
+        self.extract_progress = format!("0/{total}");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.extract_rx = Some(rx);
+        std::thread::spawn(move || {
+            for (i, file) in files.iter().enumerate() {
+                let name = file
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let _ = tx.send(Msg::Progress {
+                    done: i,
+                    total,
+                    file: name,
+                });
+                let out_dir = if out.is_empty() {
+                    file.parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| PathBuf::from("."))
+                } else {
+                    PathBuf::from(&out)
+                };
+                match crate::extract_all(file, &out_dir, None) {
+                    Ok(tracks) => {
+                        let _ = tx.send(Msg::Tracks(tracks));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::Error(format!("{}: {e}", file.display())));
+                    }
+                }
+                ctx.request_repaint();
             }
-            Err(e) => self.message = format!("抽取失败: {e}"),
+            let _ = tx.send(Msg::Finished);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_extract(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.extract_rx.take() else {
+            return;
+        };
+        let mut finished = false;
+        loop {
+            match rx.try_recv() {
+                Ok(Msg::Progress { done, total, file }) => {
+                    self.extract_progress = format!("{done}/{total}  {file}");
+                }
+                Ok(Msg::Tracks(t)) => self.extract_tracks.extend(t),
+                Ok(Msg::Error(e)) => self.extract_errors.push(e),
+                Ok(Msg::Finished) => {
+                    finished = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        if finished {
+            self.extract_progress = format!(
+                "完成：{} 条轨道{}",
+                self.extract_tracks.len(),
+                if self.extract_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!("，{} 个文件失败", self.extract_errors.len())
+                }
+            );
+        } else {
+            self.extract_rx = Some(rx);
+            ctx.request_repaint();
         }
     }
 
@@ -364,7 +449,7 @@ impl App {
             ));
             egui::ScrollArea::vertical()
                 .id_salt("plan_scroll")
-                .max_height(300.0)
+                .max_height(280.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     egui::Grid::new("plan_grid")
@@ -379,10 +464,9 @@ impl App {
                             ui.end_row();
                             for item in &plan.items {
                                 ui.monospace(basename(&item.subtitle));
-                                ui.monospace(if item.video.is_some() {
-                                    basename(item.video.as_deref().unwrap_or(""))
-                                } else {
-                                    "-"
+                                ui.monospace(match item.video.as_deref() {
+                                    Some(v) => basename(v),
+                                    None => "-",
                                 });
                                 ui.monospace(if item.target.is_empty() {
                                     "-"
@@ -405,11 +489,11 @@ impl App {
             .num_columns(3)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                ui.label("MKV 文件");
+                ui.label("输入");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.mkv)
                         .desired_width(560.0)
-                        .hint_text("选择 .mkv 文件"),
+                        .hint_text("单个 .mkv，或包含 MKV 的目录（会递归）"),
                 );
                 if ui.button("浏览").clicked() {
                     let start = self.mkv.clone();
@@ -421,7 +505,7 @@ impl App {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.out)
                         .desired_width(560.0)
-                        .hint_text("留空 = 与 MKV 同目录"),
+                        .hint_text("留空 = 每个 MKV 旁边"),
                 );
                 if ui.button("浏览").clicked() {
                     let start = self.out.clone();
@@ -429,34 +513,58 @@ impl App {
                 }
                 ui.end_row();
             });
-        if ui.button("抽取").clicked() {
-            self.run_extract();
+
+        let busy = self.extract_rx.is_some();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new("抽取"))
+                .clicked()
+            {
+                let ctx = ui.ctx().clone();
+                self.start_extract(ctx);
+            }
+            if busy {
+                ui.spinner();
+            }
+            if !self.extract_progress.is_empty() {
+                ui.label(&self.extract_progress);
+            }
+        });
+
+        for err in &self.extract_errors {
+            ui.colored_label(egui::Color32::from_rgb(200, 60, 60), err);
         }
 
-        if let Some((out, tracks)) = &self.extract {
-            ui.add_space(4.0);
-            ui.label(format!("输出到 {out}"));
-            egui::Grid::new("extract_result")
-                .num_columns(3)
-                .striped(true)
-                .spacing([12.0, 4.0])
+        if !self.extract_tracks.is_empty() {
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .id_salt("extract_result")
+                .max_height(220.0)
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for t in tracks {
-                        ui.monospace(basename(&t.file));
-                        ui.label(format!(
-                            "{} [{}]",
-                            t.name.clone().unwrap_or_default(),
-                            t.codec
-                        ));
-                        let comp = match t.compressed {
-                            Some(0) => "zlib 压缩",
-                            Some(3) => "header-strip",
-                            Some(_) => "其他压缩",
-                            None => "未压缩",
-                        };
-                        ui.label(format!("{} 条 / {}", t.events, comp));
-                        ui.end_row();
-                    }
+                    egui::Grid::new("extract_grid_result")
+                        .num_columns(4)
+                        .striped(true)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            for t in &self.extract_tracks {
+                                ui.monospace(basename(&t.file));
+                                ui.label(format!(
+                                    "{} [{}]",
+                                    t.name.clone().unwrap_or_default(),
+                                    t.codec
+                                ));
+                                let comp = match t.compressed {
+                                    Some(0) => "zlib 压缩",
+                                    Some(3) => "header-strip",
+                                    Some(_) => "其他压缩",
+                                    None => "未压缩",
+                                };
+                                ui.label(comp);
+                                ui.label(format!("{} 条", t.events));
+                                ui.end_row();
+                            }
+                        });
                 });
         }
     }
@@ -546,10 +654,10 @@ fn join_path(base: &str, name: &str) -> String {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if !self.initialized {
-            self.initialized = true;
-        }
         let ctx = ui.ctx().clone();
+        if self.extract_rx.is_some() {
+            self.poll_extract(&ctx);
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("main_scroll")

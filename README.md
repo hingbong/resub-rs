@@ -15,6 +15,9 @@ cargo build --release
 ```
 
 产物 `target/release/resub.exe`（Windows，约 4 MB），拷到任何机器双击即可运行。
+不想自己编的话，直接下 nightly release 里的 `resub.exe`（每次 push 到 main 自动覆盖）：
+https://github.com/hingbong/resub-rs/releases/tag/nightly
+
 不想要图形界面的话：
 
 ```sh
@@ -45,8 +48,9 @@ resub apply --videos D:\动画 --subs D:\字幕 --suffix .chs
 # 就地重命名字幕
 resub apply --videos D:\动画 --subs D:\字幕 --mode rename
 
-# 抽取内嵌字幕
+# 抽取内嵌字幕：单个文件，或整个目录（递归子目录里的 .mkv）
 resub extract 某集.mkv --out D:\字幕
+resub extract D:\动画 --out D:\字幕
 resub extract 某集.mkv --track 3
 ```
 

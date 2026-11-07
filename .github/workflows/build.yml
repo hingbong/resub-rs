@@ -3,9 +3,11 @@ name: build
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   test:
@@ -16,18 +18,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # The CLI/browser build has no graphics dependency, so it also runs headless here.
       - run: cargo test --release --no-default-features
-      - run: cargo build --release --no-default-features
 
   windows:
+    # Pull requests get a build check only; publishing happens from main.
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
-      - name: Show artifact size
-        run: Get-ChildItem target/release/resub.exe | Select-Object Name, Length
-      - uses: actions/upload-artifact@v4
+
+      - name: Drop the previous nightly release and its tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete nightly --cleanup-tag -y || true
+
+      - name: Publish nightly
+        uses: softprops/action-gh-release@v2
         with:
-          name: resub-windows-x64
-          path: target/release/resub.exe
+          tag_name: nightly
+          name: nightly
+          prerelease: true
+          body: |
+            Automated build of ${{ github.sha }}.
+
+            Download resub.exe and run it; there is no runtime to install.
+          files: target/release/resub.exe
+          fail_on_unmatched_files: true

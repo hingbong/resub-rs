@@ -8,7 +8,7 @@ fn usage() {
         "resub - 字幕批量改名 / MKV 内嵌字幕抽取
 
 用法:
-  resub extract <文件.mkv> [--out 目录] [--track 轨道号]
+  resub extract <文件或目录> [--out 目录] [--track 轨道号]
   resub plan    --videos <视频目录> --subs <字幕目录> [--suffix .sc] [--mode copy|rename]
   resub apply   --videos <视频目录> --subs <字幕目录> [--suffix .sc] [--mode copy|rename]
   resub gui                                     打开图形界面（原生窗口）
@@ -105,95 +105,74 @@ fn cmd_serve(named: &[(String, String)]) -> ExitCode {
 
 fn cmd_extract(named: &[(String, String)], positional: &[String]) -> ExitCode {
     let Some(input) = positional.first() else {
-        eprintln!("需要指定 MKV 文件");
+        eprintln!("需要指定 MKV 文件或目录");
         return ExitCode::FAILURE;
     };
-    let input = PathBuf::from(input);
-    if !input.is_file() {
-        eprintln!("文件不存在: {}", input.display());
+    let path = PathBuf::from(input);
+    if !path.exists() {
+        eprintln!("路径不存在: {}", path.display());
         return ExitCode::FAILURE;
     }
-
-    let tracks = match resub::mkv::read_subtitles(&input) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("读取失败: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    if tracks.is_empty() {
-        println!("没有找到文本字幕轨道。");
-        return ExitCode::SUCCESS;
-    }
-
-    println!("{:>3}  {:<12} {:<22} {:<6} {:>6}  说明", "轨", "编码", "名称", "语言", "事件");
-    for t in &tracks {
-        let comp = t
-            .info
-            .compression
-            .as_ref()
-            .map(|c| match c.algo {
-                0 => "zlib".to_string(),
-                3 => "header-strip".to_string(),
-                other => format!("algo{other}"),
-            })
-            .unwrap_or_else(|| "-".to_string());
-        println!(
-            "{:>3}  {:<12} {:<22} {:<6} {:>6}  {}",
-            t.info.number,
-            t.info.codec_id,
-            t.info.name.clone().unwrap_or_default(),
-            t.info.language.clone().unwrap_or_default(),
-            t.events.len(),
-            comp
-        );
-        if t.skipped_laced > 0 {
-            println!("     ! 跳过 {} 个带 lacing 的块", t.skipped_laced);
-        }
-        if t.skipped_undecodable > 0 {
-            println!("     ! {} 个块无法解码", t.skipped_undecodable);
-        }
+    let files = resub::collect_mkv(&path);
+    if files.is_empty() {
+        eprintln!("在 {} 里没有找到 .mkv 文件", path.display());
+        return ExitCode::FAILURE;
     }
 
     let only = opt(named, "track").and_then(|v| v.parse::<u64>().ok());
-    let out_dir = opt(named, "out")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| input.parent().unwrap_or(Path::new(".")).to_path_buf());
+    let out_override = opt(named, "out").map(PathBuf::from);
+    let multiple = files.len() > 1;
 
-    if std::fs::create_dir_all(&out_dir).is_err() {
-        eprintln!("无法创建输出目录: {}", out_dir.display());
-        return ExitCode::FAILURE;
-    }
     let mut written = 0usize;
-    for t in &tracks {
-        if let Some(n) = only {
-            if t.info.number != n {
-                continue;
+    let mut failed = 0usize;
+    for (i, file) in files.iter().enumerate() {
+        if multiple {
+            println!("[{}/{}] {}", i + 1, files.len(), file.display());
+        }
+        let out_dir = out_override
+            .clone()
+            .unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).to_path_buf());
+        match resub::extract_all(file, &out_dir, only) {
+            Ok(tracks) => {
+                if tracks.is_empty() {
+                    eprintln!(
+                        "    没有可抽取的文本字幕{}",
+                        if only.is_some() { "（轨道号未命中）" } else { "" }
+                    );
+                    continue;
+                }
+                for t in &tracks {
+                    println!(
+                        "    轨{} {} {} {} 条 -> {}",
+                        t.number,
+                        t.name.clone().unwrap_or_default(),
+                        t.codec,
+                        t.events,
+                        Path::new(&t.file)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    );
+                }
+                written += tracks.len();
+            }
+            Err(e) => {
+                eprintln!("    失败: {e}");
+                failed += 1;
             }
         }
-        if t.events.is_empty() {
-            continue;
-        }
-        let stem = input
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let tag = resub::ass::language_tag(t);
-        let ext = resub::ass::file_extension(t);
-        let path = out_dir.join(format!("{stem}.{tag}.{ext}"));
-        match std::fs::write(&path, resub::ass::render(t)) {
-            Ok(()) => {
-                println!("写出 {} ({} 条)", path.display(), t.events.len());
-                written += 1;
-            }
-            Err(e) => eprintln!("写入 {} 失败: {e}", path.display()),
-        }
     }
-    if written == 0 {
-        eprintln!("没有写出任何文件");
-        return ExitCode::FAILURE;
+    println!(
+        "完成：{} 个文件，{} 条轨道写出，{} 个文件失败",
+        files.len(),
+        written,
+        failed
+    );
+    if failed > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
-    ExitCode::SUCCESS
 }
 
 fn cmd_plan(named: &[(String, String)], execute: bool) -> ExitCode {
