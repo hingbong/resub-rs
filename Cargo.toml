@@ -12,7 +12,20 @@ path = "src/lib.rs"
 name = "resub"
 path = "src/main.rs"
 
+[features]
+default = ["gui"]
+# Native window front-end. Build with --no-default-features for a CLI/browser-only binary.
+gui = ["dep:eframe"]
+
 [dependencies]
+eframe = { version = "0.37", optional = true, default-features = false, features = [
+    "glow",         # OpenGL renderer: far smaller than wgpu and works on old iGPUs
+    "default_fonts",
+    "system_fonts", # pulls CJK glyphs from the OS, needed for the Chinese UI
+    "clipboard",
+    "wayland",
+    "x11",
+] }
 flate2 = "1"
 regex = "1"
 walkdir = "2"

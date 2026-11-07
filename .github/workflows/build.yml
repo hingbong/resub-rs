@@ -1,0 +1,33 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The CLI/browser build has no graphics dependency, so it also runs headless here.
+      - run: cargo test --release --no-default-features
+      - run: cargo build --release --no-default-features
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Show artifact size
+        run: Get-ChildItem target/release/resub.exe | Select-Object Name, Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: resub-windows-x64
+          path: target/release/resub.exe

@@ -11,7 +11,8 @@ fn usage() {
   resub extract <文件.mkv> [--out 目录] [--track 轨道号]
   resub plan    --videos <视频目录> --subs <字幕目录> [--suffix .sc] [--mode copy|rename]
   resub apply   --videos <视频目录> --subs <字幕目录> [--suffix .sc] [--mode copy|rename]
-  resub gui     [--port 8080] [--no-open]      启动本地图形界面
+  resub gui                                     打开图形界面（原生窗口）
+  resub serve   [--port 8080] [--no-open]      本地网页界面（浏览器版）
 
 plan 只预览，apply 才真正执行。默认 mode=copy，把字幕复制到视频旁边。"
     );
@@ -57,6 +58,7 @@ fn main() -> ExitCode {
     match cmd {
         "extract" => cmd_extract(&named, &positional),
         "gui" => cmd_gui(&named),
+        "serve" => cmd_serve(&named),
         "plan" => cmd_plan(&named, false),
         "apply" => cmd_plan(&named, true),
         "-h" | "--help" | "help" => {
@@ -71,7 +73,23 @@ fn main() -> ExitCode {
     }
 }
 
+#[cfg(feature = "gui")]
+fn cmd_gui(_named: &[(String, String)]) -> ExitCode {
+    match resub::gui::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("界面启动失败: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(feature = "gui"))]
 fn cmd_gui(named: &[(String, String)]) -> ExitCode {
+    cmd_serve(named)
+}
+
+fn cmd_serve(named: &[(String, String)]) -> ExitCode {
     let port = opt(named, "port")
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(0);

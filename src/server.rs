@@ -163,65 +163,14 @@ fn handle(mut req: Request) -> io::Result<()> {
     }
 }
 
-fn roots() -> Vec<String> {
-    #[cfg(windows)]
-    {
-        let mut v = Vec::new();
-        for c in b'A'..=b'Z' {
-            let p = format!("{}:\\", c as char);
-            if std::path::Path::new(&p).is_dir() {
-                v.push(p);
-            }
-        }
-        return v;
-    }
-    #[cfg(not(windows))]
-    {
-        vec!["/".to_string()]
-    }
-}
-
 fn browse(raw: &str) -> Value {
-    if raw.trim().is_empty() {
-        return json!({ "path": "", "parent": Value::Null, "dirs": roots(), "files": [] });
-    }
-    let mut path = PathBuf::from(raw);
-    if path.is_file() {
-        if let Some(p) = path.parent() {
-            path = p.to_path_buf();
-        }
-    }
-    let mut dirs: Vec<String> = Vec::new();
-    let mut files: Vec<String> = Vec::new();
-    match std::fs::read_dir(&path) {
-        Ok(rd) => {
-            for entry in rd.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') {
-                    continue;
-                }
-                if entry.path().is_dir() {
-                    dirs.push(name);
-                } else {
-                    files.push(name);
-                }
-            }
-        }
-        Err(e) => {
-            return json!({ "path": path.to_string_lossy(), "error": e.to_string(), "dirs": [], "files": [] });
-        }
-    }
-    dirs.sort_by_key(|s| s.to_lowercase());
-    files.sort_by_key(|s| s.to_lowercase());
-    let parent = path
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| String::new());
+    let l = crate::list_dir(raw, false);
     json!({
-        "path": path.to_string_lossy(),
-        "parent": if parent.is_empty() { Value::Null } else { Value::String(parent) },
-        "dirs": dirs,
-        "files": files,
+        "path": l.path,
+        "parent": l.parent,
+        "dirs": l.dirs,
+        "files": l.files,
+        "error": l.error,
     })
 }
 
