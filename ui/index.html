@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>resub</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 system-ui, "Microsoft YaHei", sans-serif; margin: 0 auto; max-width: 1100px; padding: 24px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h1 small { font-weight: normal; opacity: .6; font-size: 13px; }
+  section { border: 1px solid #8884; border-radius: 8px; padding: 16px; margin: 18px 0; }
+  section h2 { font-size: 15px; margin: 0 0 12px; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
+  label.inline { display: inline-flex; align-items: center; gap: 6px; }
+  input[type=text] { flex: 1 1 380px; padding: 6px 8px; border: 1px solid #8886; border-radius: 5px; background: transparent; color: inherit; font: inherit; }
+  input.short { flex: 0 0 110px; }
+  button { padding: 6px 14px; border: 1px solid #8886; border-radius: 5px; background: #8881; color: inherit; font: inherit; cursor: pointer; }
+  button:hover:not(:disabled) { background: #8883; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: #2f6fed; border-color: #2f6fed; color: #fff; }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid #8883; vertical-align: top; }
+  th { font-weight: 600; opacity: .75; }
+  td.mono { font-family: ui-monospace, Consolas, monospace; word-break: break-all; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 12px; white-space: nowrap; }
+  .tag.ready { background: #2f6fed22; color: #2f6fed; }
+  .tag.warn { background: #e0a80022; color: #b8860b; }
+  .tag.bad { background: #d9302522; color: #d93025; }
+  .muted { opacity: .6; }
+  #modal { position: fixed; inset: 0; background: #0008; display: none; align-items: center; justify-content: center; z-index: 10; }
+  #modal.show { display: flex; }
+  #modal .box { background: Canvas; border-radius: 8px; width: min(680px, 92vw); max-height: 80vh; display: flex; flex-direction: column; padding: 14px; }
+  #browserPath { font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; padding-bottom: 8px; border-bottom: 1px solid #8883; }
+  #browserList { list-style: none; margin: 8px 0; padding: 0; overflow: auto; flex: 1; }
+  #browserList li { padding: 5px 8px; border-radius: 4px; cursor: pointer; font-family: ui-monospace, monospace; font-size: 13px; }
+  #browserList li:hover { background: #8883; }
+  #browserList li.file { opacity: .75; }
+  #browserList li.up { opacity: .8; font-style: italic; }
+</style>
+</head>
+<body>
+<h1>resub <small>字幕批量改名 / MKV 内嵌字幕抽取</small></h1>
+
+<section>
+  <h2>批量改名</h2>
+  <div class="row">
+    <span style="width:64px">视频目录</span>
+    <input type="text" id="videos" placeholder="包含视频文件的目录">
+    <button data-pick="videos" data-mode="dir">浏览</button>
+  </div>
+  <div class="row">
+    <span style="width:64px">字幕目录</span>
+    <input type="text" id="subs" placeholder="包含字幕文件的目录">
+    <button data-pick="subs" data-mode="dir">浏览</button>
+  </div>
+  <div class="row">
+    <span style="width:64px">后缀</span>
+    <input type="text" id="suffix" class="short" value=".chs">
+    <span class="muted">字幕名里已带 .sc / .tc / .SumiSora 等标记时会沿用原名里的</span>
+  </div>
+  <div class="row">
+    <label class="inline"><input type="radio" name="mode" value="copy" checked> 复制到视频目录</label>
+    <label class="inline"><input type="radio" name="mode" value="rename"> 就地重命名</label>
+    <span style="flex:1"></span>
+    <button id="preview">预览</button>
+    <button id="apply" class="primary" disabled>执行</button>
+  </div>
+  <div id="planResult"></div>
+</section>
+
+<section>
+  <h2>抽取 MKV 内嵌字幕</h2>
+  <div class="row">
+    <span style="width:64px">MKV 文件</span>
+    <input type="text" id="mkv" placeholder="选择 .mkv 文件">
+    <button data-pick="mkv" data-mode="file">浏览</button>
+  </div>
+  <div class="row">
+    <span style="width:64px">输出目录</span>
+    <input type="text" id="out" placeholder="留空 = 与 MKV 同目录">
+    <button data-pick="out" data-mode="dir">浏览</button>
+    <button id="extract" class="primary">抽取</button>
+  </div>
+  <div id="extractResult"></div>
+</section>
+
+<div id="modal">
+  <div class="box">
+    <div id="browserPath"></div>
+    <ul id="browserList"></ul>
+    <div class="row" style="justify-content:flex-end;margin:0">
+      <button id="browserCancel">取消</button>
+      <button id="browserOk" class="primary">选择此目录</button>
+    </div>
+  </div>
+</div>
+
+<script>
+var $ = function (id) { return document.getElementById(id); };
+var picker = { target: null, mode: 'dir', path: '', selected: null };
+
+function setText(el, s) { el.textContent = s; }
+
+function statusTag(plan) {
+  var map = {
+    ready: ['ready', '就绪'],
+    target_exists: ['warn', '目标已存在'],
+    already_named: ['warn', '已是目标名'],
+    no_video: ['bad', '找不到视频'],
+    ambiguous: ['warn', '集数重复']
+  };
+  var m = map[plan] || ['warn', plan];
+  var span = document.createElement('span');
+  span.className = 'tag ' + m[0];
+  span.textContent = m[1];
+  return span;
+}
+
+function basename(p) {
+  if (!p) return '';
+  var parts = p.split(/[\\/]/);
+  return parts[parts.length - 1];
+}
+
+function renderPlan(data) {
+  var root = $('planResult');
+  root.textContent = '';
+  if (data.error) {
+    root.appendChild(document.createTextNode('错误: ' + data.error));
+    return;
+  }
+  var p = data.plan;
+  var head = document.createElement('div');
+  head.className = 'muted';
+  head.style.marginTop = '10px';
+  head.textContent = '视频 ' + p.video_count + ' 个 / 字幕 ' + p.subtitle_count + ' 个';
+  if (data.applied) head.textContent += ' / 已执行 ' + data.ok + ' 条';
+  root.appendChild(head);
+
+  var table = document.createElement('table');
+  var thead = document.createElement('thead');
+  var hr = document.createElement('tr');
+  ['字幕文件', '对应视频', '重命名为', '状态'].forEach(function (t) {
+    var th = document.createElement('th');
+    th.textContent = t;
+    hr.appendChild(th);
+  });
+  thead.appendChild(hr);
+  table.appendChild(thead);
+  var tb = document.createElement('tbody');
+  p.items.forEach(function (item) {
+    var tr = document.createElement('tr');
+    var td1 = document.createElement('td');
+    td1.className = 'mono';
+    td1.textContent = basename(item.subtitle);
+    var td2 = document.createElement('td');
+    td2.className = 'mono';
+    td2.textContent = basename(item.video);
+    var td3 = document.createElement('td');
+    td3.className = 'mono';
+    td3.textContent = basename(item.target);
+    var td4 = document.createElement('td');
+    td4.appendChild(statusTag(item.status));
+    if (item.episode != null) {
+      var e = document.createElement('span');
+      e.className = 'muted';
+      e.style.marginLeft = '8px';
+      e.textContent = 'EP' + item.episode;
+      td4.appendChild(e);
+    }
+    [td1, td2, td3, td4].forEach(function (td) { tr.appendChild(td); });
+    tb.appendChild(tr);
+  });
+  table.appendChild(tb);
+  root.appendChild(table);
+
+  var ready = p.items.filter(function (i) { return i.status === 'ready'; }).length;
+  $('apply').disabled = ready === 0 || !!data.applied;
+  $('apply').textContent = ready ? '执行 ' + ready + ' 条' : '执行';
+}
+
+function planBody() {
+  var mode = document.querySelector('input[name=mode]:checked').value;
+  return JSON.stringify({
+    videos: $('videos').value.trim(),
+    subs: $('subs').value.trim(),
+    suffix: $('suffix').value.trim(),
+    mode: mode
+  });
+}
+
+function post(url, body) {
+  return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body })
+    .then(function (r) { return r.json(); });
+}
+
+$('preview').onclick = function () {
+  post('/api/plan', planBody()).then(renderPlan).catch(function (e) {
+    $('planResult').textContent = '请求失败: ' + e;
+  });
+};
+
+$('apply').onclick = function () {
+  if (!confirm('确认执行改名？此操作会修改磁盘上的文件。')) return;
+  post('/api/apply', planBody()).then(renderPlan).catch(function (e) {
+    $('planResult').textContent = '请求失败: ' + e;
+  });
+};
+
+$('extract').onclick = function () {
+  var root = $('extractResult');
+  root.textContent = '处理中…';
+  post('/api/extract', JSON.stringify({ file: $('mkv').value.trim(), out: $('out').value.trim() }))
+    .then(function (data) {
+      root.textContent = '';
+      if (data.error) { root.textContent = '错误: ' + data.error; return; }
+      var d = document.createElement('div');
+      d.className = 'muted';
+      d.style.marginTop = '10px';
+      d.textContent = '输出到 ' + data.out;
+      root.appendChild(d);
+      var table = document.createElement('table');
+      var tb = document.createElement('tbody');
+      data.tracks.forEach(function (t) {
+        var tr = document.createElement('tr');
+        var td1 = document.createElement('td');
+        td1.className = 'mono';
+        td1.textContent = basename(t.file);
+        var td2 = document.createElement('td');
+        td2.textContent = (t.name || '') + ' [' + t.codec + ']';
+        var td3 = document.createElement('td');
+        td3.textContent = t.events + ' 条';
+        var td4 = document.createElement('td');
+        td4.className = 'muted';
+        td4.textContent = t.compressed === 0 ? 'zlib 压缩' : (t.compressed === 3 ? 'header-strip' : '未压缩');
+        [td1, td2, td3, td4].forEach(function (td) { tr.appendChild(td); });
+        tb.appendChild(tr);
+      });
+      table.appendChild(tb);
+      root.appendChild(table);
+      if (!data.tracks.length) root.appendChild(document.createTextNode('没有找到文本字幕轨道'));
+    })
+    .catch(function (e) { root.textContent = '请求失败: ' + e; });
+};
+
+document.querySelectorAll('[data-pick]').forEach(function (btn) {
+  btn.onclick = function () {
+    picker.target = btn.getAttribute('data-pick');
+    picker.mode = btn.getAttribute('data-mode');
+    picker.selected = null;
+    var start = $(picker.target).value.trim();
+    setText($('browserOk'), picker.mode === 'file' ? '选择此目录' : '选择此目录');
+    $('modal').classList.add('show');
+    loadDir(start || '');
+  };
+});
+
+$('browserCancel').onclick = function () { $('modal').classList.remove('show'); };
+
+$('browserOk').onclick = function () {
+  var v = picker.selected || picker.path;
+  if (v) $(picker.target).value = v;
+  $('modal').classList.remove('show');
+};
+
+function loadDir(path) {
+  $('browserList').textContent = '加载中…';
+  fetch('/api/browse?path=' + encodeURIComponent(path))
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      picker.path = data.path;
+      picker.selected = null;
+      setText($('browserPath'), data.path || '(根目录)');
+      var ul = $('browserList');
+      ul.textContent = '';
+      if (data.error) {
+        var li = document.createElement('li');
+        li.textContent = '无法读取: ' + data.error;
+        ul.appendChild(li);
+        return;
+      }
+      if (data.parent != null) {
+        ul.appendChild(listItem('..', 'up', function () { loadDir(data.parent); }));
+      }
+      data.dirs.forEach(function (name) {
+        ul.appendChild(listItem('[DIR] ' + name, '', function () {
+          loadDir(data.path ? data.path.replace(/[\\/]+$/, '') + '/' + name : name);
+        }));
+      });
+      if (picker.mode === 'file') {
+        data.files.forEach(function (name) {
+          ul.appendChild(listItem(name, 'file', function (ev) {
+            ul.querySelectorAll('li').forEach(function (n) { n.classList.remove('sel'); });
+            ev.currentTarget.classList.add('sel');
+            picker.selected = (data.path ? data.path.replace(/[\\/]+$/, '') + '/' : '') + name;
+          }));
+        });
+      }
+    });
+}
+
+function listItem(text, cls, onclick) {
+  var li = document.createElement('li');
+  li.textContent = text;
+  if (cls) li.className = cls;
+  li.onclick = onclick;
+  return li;
+}
+</script>
+</body>
+</html>

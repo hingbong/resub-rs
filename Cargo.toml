@@ -1,0 +1,28 @@
+[package]
+name = "resub"
+version = "0.1.0"
+edition = "2021"
+description = "Batch-rename fan-subtitle files and extract embedded ASS/SSA from Matroska"
+
+[lib]
+name = "resub"
+path = "src/lib.rs"
+
+[[bin]]
+name = "resub"
+path = "src/main.rs"
+
+[dependencies]
+flate2 = "1"
+regex = "1"
+walkdir = "2"
+tiny_http = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
