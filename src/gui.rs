@@ -310,7 +310,7 @@ impl App {
                 } else {
                     PathBuf::from(&out)
                 };
-                match crate::extract_all(file, &out_dir, None) {
+                match crate::extract_all(file, &out_dir, None, false) {
                     Ok(tracks) => {
                         let _ = tx.send(Msg::Tracks(tracks));
                     }

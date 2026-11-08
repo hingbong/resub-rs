@@ -12,6 +12,9 @@ Windows 直接下 [nightly release](https://github.com/hingbong/resub-rs/release
 `resub.exe`，每次 push 到 main 自动重新构建并覆盖同一个 release。
 双击即用，不需要安装任何运行时。
 
+NAS 用 `resub-linux-x86_64`：静态链接的 musl 二进制，不依赖系统的 glibc，
+拷过去 `chmod +x` 就能跑。见下面「在 NAS 上跑」。
+
 ## 构建
 
 只需要 [Rust](https://rustup.rs)：
@@ -61,6 +64,38 @@ resub extract D:\动画 --out D:\字幕
 resub extract 某集.mkv --track 3
 ```
 
+### 在 NAS 上跑（不想让视频绕一圈）
+
+抽取内嵌字幕必须走完整个 MKV：Matroska 的 cluster 是所有轨道交错存的，字幕块散落
+在每一个 cluster 里，没有一个能跳过 payload 的索引。所以在电脑上抽 NAS 上的片子，
+等于把整部片子先拉一遍到本地。
+
+把 resub 放到 NAS 上跑就没有这个问题：读的是本地磁盘，写回同目录，网络流量为零。
+
+```sh
+# 拷到 NAS 上（群晖例：/volume1/@appstore 或家目录都行）
+chmod +x resub-linux-x86_64
+
+# 整个目录递归抽取，字幕写在各自的 MKV 旁边
+./resub-linux-x86_64 extract /volume1/video/动画 --skip-existing
+```
+
+`--skip-existing` 是给 NAS 准备的：输出名只从文件头部的 Tracks 元素推出来，
+已经抽过的文件读几 KB 就能判定并跳过。一集 400 MB 的 MKV，第二次运行是毫秒级的：
+
+```
+$ ./resub-linux-x86_64 extract 某集.mkv --out /tmp/out
+完成：1 个文件，2 条轨道写出，0 条已存在跳过，0 个文件失败      real 1.85s
+$ ./resub-linux-x86_64 extract 某集.mkv --out /tmp/out --skip-existing
+完成：1 个文件，0 条轨道写出，2 条已存在跳过，0 个文件失败      real 0.002s
+```
+
+想定时跑就丢给计划任务（群晖：控制面板 → 任务计划），每天扫一遍：
+
+```sh
+./resub-linux-x86_64 extract /volume1/video --skip-existing
+```
+
 ### 浏览器界面（可选）
 
 如果不想用原生窗口，也可以用浏览器当界面：
@@ -71,6 +106,15 @@ resub serve --port 8080
 
 文件读写全部由 Rust 进程完成，浏览器只负责显示，所以 **Firefox 也能用**
 （不依赖 Chromium 独有的 File System Access API）。
+
+默认只监听 `127.0.0.1`。在 NAS 上跑、想从别的机器打开界面，就加 `--host 0.0.0.0`：
+
+```sh
+./resub-linux-x86_64 serve --host 0.0.0.0 --port 8080 --no-open
+```
+
+然后在 Windows 浏览器打开 `http://群晖IP:8080`。注意这个界面没有鉴权，
+只在自家局域网里这么用。
 
 ## 和原版的差别
 

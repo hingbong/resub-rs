@@ -121,39 +121,90 @@ where
     Ok(())
 }
 
-/// Read every text subtitle track of a Matroska file, blocks decoded and sorted by time.
-pub fn read_subtitles(path: &Path) -> io::Result<Vec<SubtitleTrack>> {
-    let file = File::open(path)?;
-    let total = file.metadata()?.len();
-    let mut r = BufReader::with_capacity(1 << 20, file);
-
-    // Find the Segment. The EBML header is a single element at the start.
-    let mut segment: Option<(u64, Option<u64>)> = None;
+/// Locate the Segment element and return the bounds of its payload.
+fn find_segment<R: Read + Seek>(r: &mut R, total: u64) -> io::Result<(u64, u64)> {
     let mut pos = 0u64;
     while pos < total {
         r.seek(SeekFrom::Start(pos))?;
-        let id = match ebml::read_id(&mut r)? {
+        let id = match ebml::read_id(r)? {
             Some(id) => id,
             None => break,
         };
-        let size = ebml::read_size(&mut r)?;
+        let size = ebml::read_size(r)?;
         let data_start = r.stream_position()?;
         if id == ID_SEGMENT {
-            segment = Some((data_start, size));
-            break;
+            let end = match size {
+                Some(s) => data_start.saturating_add(s).min(total),
+                None => total,
+            };
+            return Ok((data_start, end));
         }
         pos = match size {
             Some(s) => data_start.saturating_add(s),
             None => break,
         };
     }
-    let (seg_start, seg_size) = segment.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "no Matroska Segment found")
-    })?;
-    let seg_end = match seg_size {
-        Some(s) => seg_start.saturating_add(s).min(total),
-        None => total,
-    };
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "no Matroska Segment found",
+    ))
+}
+
+/// Read only the Tracks element, stopping at the first Cluster.
+///
+/// The header of a Matroska file is a few kilobytes, so this never touches the media
+/// payload. That makes it cheap enough to plan output names -- and to decide that a
+/// file is already done -- before committing to a full scan of a multi-gigabyte file.
+pub fn read_tracks(path: &Path) -> io::Result<Vec<TrackInfo>> {
+    let file = File::open(path)?;
+    let total = file.metadata()?.len();
+    let mut r = BufReader::with_capacity(1 << 16, file);
+    let (seg_start, seg_end) = find_segment(&mut r, total)?;
+
+    let mut tracks: Vec<TrackInfo> = Vec::new();
+    let mut pos = seg_start;
+    while pos < seg_end {
+        r.seek(SeekFrom::Start(pos))?;
+        let id = match ebml::read_id(&mut r)? {
+            Some(id) => id,
+            None => break,
+        };
+        let size = match ebml::read_size(&mut r)? {
+            Some(s) => s,
+            None => break,
+        };
+        let data_start = r.stream_position()?;
+        let data_end = data_start.saturating_add(size).min(seg_end);
+        match id {
+            ID_TRACKS => {
+                read_track_entries(&mut r, data_start, data_end, &mut tracks)?;
+                return Ok(tracks);
+            }
+            // Tracks always precedes the media data; a cluster means the header ended.
+            ID_CLUSTER => break,
+            _ => {}
+        }
+        pos = data_end;
+    }
+    Ok(tracks)
+}
+
+/// Read every text subtitle track of a Matroska file, blocks decoded and sorted by time.
+pub fn read_subtitles(path: &Path) -> io::Result<Vec<SubtitleTrack>> {
+    read_subtitles_where(path, None)
+}
+
+/// Like read_subtitles, but only the track numbers in want have their blocks
+/// collected and are returned. An empty set would still walk every cluster, so callers
+/// must short-circuit that case instead of calling this.
+pub fn read_subtitles_where(
+    path: &Path,
+    want: Option<&HashSet<u64>>,
+) -> io::Result<Vec<SubtitleTrack>> {
+    let file = File::open(path)?;
+    let total = file.metadata()?.len();
+    let mut r = BufReader::with_capacity(1 << 20, file);
+    let (seg_start, seg_end) = find_segment(&mut r, total)?;
 
     let mut tracks: Vec<TrackInfo> = Vec::new();
     let mut blocks: Vec<RawBlock> = Vec::new();
@@ -175,8 +226,12 @@ pub fn read_subtitles(path: &Path) -> io::Result<Vec<SubtitleTrack>> {
         };
         match id {
             ID_TRACKS => {
-                read_tracks(&mut r, data_start, data_end, &mut tracks)?;
+                read_track_entries(&mut r, data_start, data_end, &mut tracks)?;
                 sub_numbers = tracks.iter().map(|t| t.number).collect();
+                if let Some(w) = want {
+                    // Only subtitle tracks the caller still needs keep their blocks.
+                    sub_numbers.retain(|n| w.contains(n));
+                }
             }
             ID_CLUSTER => read_cluster(
                 &mut r,
@@ -193,6 +248,7 @@ pub fn read_subtitles(path: &Path) -> io::Result<Vec<SubtitleTrack>> {
 
     let mut out: Vec<SubtitleTrack> = tracks
         .into_iter()
+        .filter(|info| want.map_or(true, |w| w.contains(&info.number)))
         .map(|info| SubtitleTrack {
             info,
             events: Vec::new(),
@@ -273,7 +329,7 @@ fn decode_payload(info: &TrackInfo, payload: &[u8]) -> io::Result<Vec<u8>> {
     }
 }
 
-fn read_tracks<R: Read + Seek>(
+fn read_track_entries<R: Read + Seek>(
     r: &mut R,
     start: u64,
     end: u64,

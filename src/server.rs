@@ -29,8 +29,8 @@ struct ExtractReq {
     out: String,
 }
 
-pub fn run(port: u16, open: bool) -> io::Result<()> {
-    let addr = format!("127.0.0.1:{port}");
+pub fn run(host: &str, port: u16, open: bool) -> io::Result<()> {
+    let addr = format!("{host}:{port}");
     let server = Server::http(&addr)
         .map_err(|e| io::Error::new(io::ErrorKind::AddrInUse, e.to_string()))?;
     let actual = server
@@ -38,8 +38,12 @@ pub fn run(port: u16, open: bool) -> io::Result<()> {
         .to_ip()
         .map(|a| a.port())
         .unwrap_or(port);
-    let url = format!("http://127.0.0.1:{actual}/");
+    let shown = if host == "0.0.0.0" { "127.0.0.1" } else { host };
+    let url = format!("http://{shown}:{actual}/");
     println!("resub 已启动: {url}  (Ctrl+C 退出)");
+    if host == "0.0.0.0" {
+        println!("局域网访问: http://<本机IP>:{actual}/");
+    }
     if open {
         open_browser(&url);
     }
@@ -235,7 +239,7 @@ fn handle_extract(body: &str) -> Value {
         } else {
             PathBuf::from(req.out.trim())
         };
-        match crate::extract_all(f, &dir, None) {
+        match crate::extract_all(f, &dir, None, false) {
             Ok(mut t) => all.append(&mut t),
             Err(e) => errors.push(format!("{}: {e}", f.display())),
         }

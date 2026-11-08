@@ -47,11 +47,12 @@ fn usage() {
 双击 resub.exe 直接打开界面；也可以从命令行使用：
 
 用法:
-  resub extract <文件或目录> [--out 目录] [--track 轨道号]
+  resub extract <文件或目录> [--out 目录] [--track 轨道号] [--skip-existing]
   resub plan    --videos <视频目录> --subs <字幕目录> [--suffix .sc] [--mode copy|rename]
   resub apply   --videos <视频目录> --subs <字幕目录> [--suffix .sc] [--mode copy|rename]
   resub gui                                     打开图形界面（原生窗口）
-  resub serve   [--port 8080] [--no-open]      本地网页界面（浏览器版）
+  resub serve   [--port 8080] [--host 0.0.0.0] [--no-open]
+                                                网页界面（浏览器版）
 
 plan 只预览，apply 才真正执行。默认 mode=copy，把字幕复制到视频旁边。"
     );
@@ -150,8 +151,10 @@ fn cmd_serve(named: &[(String, String)]) -> ExitCode {
     let port = opt(named, "port")
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(0);
+    // Loopback by default; a NAS needs --host 0.0.0.0 so a browser elsewhere can reach it.
+    let host = opt(named, "host").unwrap_or("127.0.0.1");
     let no_open = named.iter().any(|(k, _)| k == "no-open");
-    match resub::server::run(port, !no_open) {
+    match resub::server::run(host, port, !no_open) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("启动失败: {e}");
@@ -178,9 +181,11 @@ fn cmd_extract(named: &[(String, String)], positional: &[String]) -> ExitCode {
 
     let only = opt(named, "track").and_then(|v| v.parse::<u64>().ok());
     let out_override = opt(named, "out").map(PathBuf::from);
+    let skip_existing = named.iter().any(|(k, _)| k == "skip-existing");
     let multiple = files.len() > 1;
 
     let mut written = 0usize;
+    let mut skipped = 0usize;
     let mut failed = 0usize;
     for (i, file) in files.iter().enumerate() {
         if multiple {
@@ -189,7 +194,7 @@ fn cmd_extract(named: &[(String, String)], positional: &[String]) -> ExitCode {
         let out_dir = out_override
             .clone()
             .unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).to_path_buf());
-        match resub::extract_all(file, &out_dir, only) {
+        match resub::extract_all(file, &out_dir, only, skip_existing) {
             Ok(tracks) => {
                 if tracks.is_empty() {
                     eprintln!(
@@ -198,7 +203,10 @@ fn cmd_extract(named: &[(String, String)], positional: &[String]) -> ExitCode {
                     );
                     continue;
                 }
-                for t in &tracks {
+                let here_skipped = tracks.iter().filter(|t| t.skipped).count();
+                skipped += here_skipped;
+                written += tracks.len() - here_skipped;
+                for t in tracks.iter().filter(|t| !t.skipped) {
                     println!(
                         "    轨{} {} {} {} 条 -> {}",
                         t.number,
@@ -211,7 +219,6 @@ fn cmd_extract(named: &[(String, String)], positional: &[String]) -> ExitCode {
                             .unwrap_or_default()
                     );
                 }
-                written += tracks.len();
             }
             Err(e) => {
                 eprintln!("    失败: {e}");
@@ -220,9 +227,10 @@ fn cmd_extract(named: &[(String, String)], positional: &[String]) -> ExitCode {
         }
     }
     println!(
-        "完成：{} 个文件，{} 条轨道写出，{} 个文件失败",
+        "完成：{} 个文件，{} 条轨道写出，{} 条已存在跳过，{} 个文件失败",
         files.len(),
         written,
+        skipped,
         failed
     );
     if failed > 0 {

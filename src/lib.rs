@@ -8,6 +8,7 @@ pub mod mkv;
 pub mod rename;
 pub mod server;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -144,45 +145,78 @@ pub struct ExtractedTrack {
     pub compressed: Option<u64>,
     pub events: usize,
     pub file: String,
+    /// True when the output file already existed and was left untouched.
+    pub skipped: bool,
 }
 
 /// Extract the text subtitle tracks of one MKV into separate .ass/.srt files.
-/// Passing a track number restricts the work to that one track.
+///
+/// Passing a track number restricts the work to that one track. With skip_existing a
+/// track whose output file already exists is reported but not rewritten -- and because
+/// the output names are planned from the Tracks element alone, a file whose subtitles
+/// are all present is finished after reading a few kilobytes of its header.
 pub fn extract_all(
     mkv: &Path,
     out_dir: &Path,
     only: Option<u64>,
+    skip_existing: bool,
 ) -> std::io::Result<Vec<ExtractedTrack>> {
     std::fs::create_dir_all(out_dir)?;
-    let tracks = mkv::read_subtitles(mkv)?;
     let stem = mkv
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "subtitle".into());
 
-    let mut out = Vec::new();
-    for t in &tracks {
-        if t.events.is_empty() {
-            continue;
-        }
+    let mut out: Vec<ExtractedTrack> = Vec::new();
+    let mut want: HashSet<u64> = HashSet::new();
+    for info in mkv::read_tracks(mkv)? {
         if let Some(number) = only {
-            if t.info.number != number {
+            if info.number != number {
                 continue;
             }
         }
-        let tag = ass::language_tag(t);
-        let ext = ass::file_extension(t);
-        let file = out_dir.join(format!("{stem}.{tag}.{ext}"));
-        std::fs::write(&file, ass::render(t))?;
+        let path = out_dir.join(format!(
+            "{stem}.{}.{}",
+            ass::language_tag(&info),
+            ass::file_extension(&info)
+        ));
+        let skipped = skip_existing && path.exists();
+        if !skipped {
+            want.insert(info.number);
+        }
         out.push(ExtractedTrack {
-            number: t.info.number,
-            codec: t.info.codec_id.clone(),
-            name: t.info.name.clone(),
-            language: t.info.language.clone(),
-            compressed: t.info.compression.as_ref().map(|c| c.algo),
-            events: t.events.len(),
-            file: file.to_string_lossy().to_string(),
+            number: info.number,
+            codec: info.codec_id.clone(),
+            name: info.name.clone(),
+            language: info.language.clone(),
+            compressed: info.compression.as_ref().map(|c| c.algo),
+            events: 0,
+            file: path.to_string_lossy().to_string(),
+            skipped,
         });
     }
-    Ok(out)
+    if want.is_empty() {
+        return Ok(out);
+    }
+
+    let tracks = mkv::read_subtitles_where(mkv, Some(&want))?;
+    let mut done: Vec<ExtractedTrack> = Vec::with_capacity(out.len());
+    for entry in out {
+        if entry.skipped {
+            done.push(entry);
+            continue;
+        }
+        let Some(t) = tracks.iter().find(|t| t.info.number == entry.number) else {
+            continue;
+        };
+        if t.events.is_empty() {
+            continue;
+        }
+        std::fs::write(&entry.file, ass::render(t))?;
+        done.push(ExtractedTrack {
+            events: t.events.len(),
+            ..entry
+        });
+    }
+    Ok(done)
 }

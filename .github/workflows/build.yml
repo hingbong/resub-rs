@@ -20,20 +20,53 @@ jobs:
       - run: cargo test --release --no-default-features
 
   windows:
-    # Pull requests get a build check only; publishing happens from main.
-    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: target/release/resub.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+      # Static musl build: runs on any x86_64 NAS without caring about its glibc.
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --no-default-features --target x86_64-unknown-linux-musl
+      - run: cp target/x86_64-unknown-linux-musl/release/resub resub-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: resub-linux-x86_64
+
+  publish:
+    # Pull requests get a build check only; publishing happens from main.
+    if: github.event_name != 'pull_request'
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - run: ls -la dist
 
       - name: Drop the previous nightly release and its tag
-        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release delete nightly --cleanup-tag -y || true
+        run: gh release delete nightly --repo "${{ github.repository }}" --cleanup-tag -y || true
 
       - name: Publish nightly
         uses: softprops/action-gh-release@v2
@@ -44,6 +77,11 @@ jobs:
           body: |
             Automated build of ${{ github.sha }}.
 
-            Download resub.exe and run it; there is no runtime to install.
-          files: target/release/resub.exe
+            - resub.exe -- Windows, double-click to open the window
+            - resub-linux-x86_64 -- static musl binary for x86_64 Linux, no runtime to install
+
+            On a NAS:
+              chmod +x resub-linux-x86_64
+              ./resub-linux-x86_64 extract /volume1/video --skip-existing
+          files: dist/*
           fail_on_unmatched_files: true

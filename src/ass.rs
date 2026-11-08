@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use crate::mkv::{Event, SubtitleTrack};
+use crate::mkv::{Event, SubtitleTrack, TrackInfo};
 
 const DEFAULT_ASS_HEADER: &str = "[Script Info]
 ScriptType: v4.00+
@@ -106,8 +106,8 @@ pub fn render_srt(track: &SubtitleTrack) -> String {
 }
 
 /// Pick a readable suffix for a track: Chinese simplified/traditional first, then language.
-pub fn language_tag(track: &SubtitleTrack) -> String {
-    let name = track.info.name.clone().unwrap_or_default();
+pub fn language_tag(info: &TrackInfo) -> String {
+    let name = info.name.clone().unwrap_or_default();
     let lower = name.to_lowercase();
     if name.contains('简') || name.contains('簡') || lower.contains("simplified") || lower.contains("chs") {
         return "chs".into();
@@ -115,16 +115,16 @@ pub fn language_tag(track: &SubtitleTrack) -> String {
     if name.contains('繁') || lower.contains("traditional") || lower.contains("cht") {
         return "cht".into();
     }
-    let lang = track.info.language.clone().unwrap_or_default().to_lowercase();
+    let lang = info.language.clone().unwrap_or_default().to_lowercase();
     match lang.as_str() {
         "chi" | "zho" | "zh" => "zh".into(),
-        "" | "und" => format!("track{}", track.info.number),
+        "" | "und" => format!("track{}", info.number),
         other => other.to_string(),
     }
 }
 
-pub fn file_extension(track: &SubtitleTrack) -> &'static str {
-    if track.info.is_utf8() {
+pub fn file_extension(info: &TrackInfo) -> &'static str {
+    if info.is_utf8() {
         "srt"
     } else {
         "ass"
