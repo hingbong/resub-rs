@@ -298,6 +298,9 @@ impl Browse {
 enum Job {
     Browse(Browse),
     Status(String),
+    /// Deployment finished; remembers where the binary came from so the next one
+    /// does not download it again.
+    Deployed { local: String, msg: String },
     Failed(String),
 }
 
@@ -548,6 +551,13 @@ impl App {
                         st.loading = false;
                     }
                 }
+                Ok(Job::Deployed { local, msg }) => {
+                    self.nas_local = local;
+                    self.remote_status = format!("{msg}，点「连接」验证");
+                    if let Some(st) = self.browse.as_mut() {
+                        st.loading = false;
+                    }
+                }
                 Ok(Job::Failed(e)) => {
                     self.remote_status = e.clone();
                     if let Some(st) = self.browse.as_mut() {
@@ -599,25 +609,45 @@ impl App {
         let Some(t) = self.ssh_target() else {
             return;
         };
-        let local = self.nas_local.trim().to_string();
-        if local.is_empty() {
-            self.remote_status = "先选本地那份 resub-linux-x86_64".to_string();
-            return;
-        }
-        let path = PathBuf::from(&local);
-        if !path.is_file() {
-            self.remote_status = format!("找不到: {local}");
-            return;
-        }
         let bin = self.nas_bin.trim().to_string();
         if bin.is_empty() {
             self.remote_status = "远程程序路径不能为空".to_string();
             return;
         }
-        self.remote_status = format!("正在上传到 {} …", t.dest());
-        self.spawn_job(ctx, move || match crate::ssh::deploy(&t, &bin, &path) {
-            Ok(s) => Job::Status(s),
-            Err(e) => Job::Failed(format!("部署失败: {e}")),
+        // Nothing picked locally? Fetch the release asset, so deployment is one click.
+        let chosen = match self.nas_local.trim() {
+            "" => None,
+            local => {
+                let p = PathBuf::from(local);
+                if !p.is_file() {
+                    self.remote_status = format!("找不到: {local}");
+                    return;
+                }
+                Some(p)
+            }
+        };
+        self.remote_status = match &chosen {
+            Some(p) => format!("正在上传 {} …", p.display()),
+            None => "本地没有二进制，先从 nightly 下载…".to_string(),
+        };
+        self.spawn_job(ctx, move || {
+            let path = match chosen {
+                Some(p) => p,
+                None => {
+                    let dest = std::env::temp_dir().join("resub-linux-x86_64");
+                    if let Err(e) = crate::ssh::fetch_binary(&dest) {
+                        return Job::Failed(format!("下载失败: {e}"));
+                    }
+                    dest
+                }
+            };
+            match crate::ssh::deploy(&t, &bin, &path) {
+                Ok(msg) => Job::Deployed {
+                    local: path.to_string_lossy().to_string(),
+                    msg,
+                },
+                Err(e) => Job::Failed(format!("部署失败: {e}")),
+            }
         });
     }
 
@@ -994,7 +1024,7 @@ impl App {
                     ui.add_sized(
                         [560.0, ui.spacing().interact_size.y],
                         egui::TextEdit::singleline(&mut self.nas_local)
-                            .hint_text("要上传的 resub-linux-x86_64"),
+                            .hint_text("留空 = 自动从 nightly 下载"),
                     );
                     if ui.button("选择").clicked() {
                         if let Some(p) = pick_any("选择 resub-linux-x86_64", &self.nas_local) {

@@ -15,7 +15,8 @@ use serde_json::Value;
 pub struct Target {
     user: String,
     host: String,
-    port: u16,
+    /// None means "say nothing", so ssh reads Port from ~/.ssh/config.
+    port: Option<u16>,
 }
 
 impl Target {
@@ -32,12 +33,14 @@ impl Target {
             Some((u, r)) => (u.to_string(), r.to_string()),
             None => (String::new(), s.to_string()),
         };
+        // No port in the address means the ssh config keeps the last word. Passing
+        // -p 22 unconditionally would override a Port line that is already there.
         let (host, port) = match rest.rsplit_once(':') {
             Some((h, p)) => (
                 h.to_string(),
-                p.parse::<u16>().map_err(|_| format!("端口不对: {p}"))?,
+                Some(p.parse::<u16>().map_err(|_| format!("端口不对: {p}"))?),
             ),
-            None => (rest, 22),
+            None => (rest, None),
         };
         if host.is_empty() {
             return Err("NAS 地址缺少主机名".into());
@@ -53,7 +56,7 @@ impl Target {
         }
     }
 
-    pub fn port(&self) -> u16 {
+    pub fn port(&self) -> Option<u16> {
         self.port
     }
 
@@ -69,7 +72,9 @@ impl Target {
 
     fn ssh(&self, remote: &str) -> Command {
         let mut c = Command::new("ssh");
-        c.arg("-p").arg(self.port.to_string());
+        if let Some(p) = self.port {
+            c.arg("-p").arg(p.to_string());
+        }
         for o in self.options() {
             c.arg(o);
         }
@@ -117,21 +122,78 @@ fn run(mut cmd: Command, what: &str) -> Result<String, String> {
     Ok(stdout)
 }
 
+/// A login banner or a shell notice can end up in front of our own output.
+fn last_line(s: &str) -> String {
+    s.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .next_back()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The JSON payload is always one line; anything else is the shell's own noise.
+fn last_json(s: &str) -> Option<&str> {
+    s.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('{') && l.ends_with('}'))
+        .filter(|l| serde_json::from_str::<Value>(l).is_ok())
+        .next_back()
+}
+
 /// Check that the remote binary exists and runs.
+///
+/// The tokens are searched for anywhere in the output rather than taken from the last
+/// line: a login banner or a shell notice may turn up before or after our own text,
+/// and an implementation detail of the other end must not be mistaken for an answer.
 pub fn probe(t: &Target, bin: &str) -> Result<String, String> {
-    let remote = format!("{bin} --help >/dev/null && echo ok");
+    let remote = format!(
+        "if [ -x {bin} ]; then {bin} --help >/dev/null 2>&1 && echo RESUB_OK || echo RESUB_BROKEN; else echo RESUB_MISSING; fi"
+    );
     let out = run(t.ssh(&remote), "ssh")?;
-    if out.contains("ok") {
+    if out.contains("RESUB_OK") {
         Ok(format!("{} 上的 resub 可用", t.dest()))
+    } else if out.contains("RESUB_MISSING") {
+        Err(format!(
+            "{} 上还没有 resub（{bin}）。先点「部署」。",
+            t.dest()
+        ))
+    } else if out.contains("RESUB_BROKEN") {
+        Err(format!(
+            "{} 上的文件跑不起来（{bin}），可能架构不对或没有执行权限",
+            t.dest()
+        ))
     } else {
-        Err(format!("{} 没有响应", bin))
+        Err(format!("意外输出: {}", last_line(&out)))
     }
 }
+
+/// Fetch the x86_64 Linux build into a local path. Uses curl, which ships with
+/// Windows 10 1803+ and with virtually every Linux.
+pub fn fetch_binary(dest: &std::path::Path) -> Result<(), String> {
+    let mut c = Command::new("curl");
+    c.args(["-L", "--fail", "--silent", "--show-error"])
+        .arg("-o")
+        .arg(dest)
+        .arg(LINUX_ASSET_URL);
+    c.stdin(Stdio::null());
+    quiet(&mut c);
+    run(c, "curl")?;
+    if !dest.is_file() {
+        return Err("curl 没有生成文件".into());
+    }
+    Ok(())
+}
+
+pub const LINUX_ASSET_URL: &str =
+    "https://github.com/hingbong/resub-rs/releases/download/nightly/resub-linux-x86_64";
 
 /// Copy the local Linux binary over and make it executable.
 pub fn deploy(t: &Target, bin: &str, local: &Path) -> Result<String, String> {
     let mut c = Command::new("scp");
-    c.arg("-P").arg(t.port.to_string());
+    if let Some(p) = t.port {
+        c.arg("-P").arg(p.to_string());
+    }
     for o in t.options() {
         c.arg(o);
     }
@@ -149,7 +211,9 @@ pub fn deploy(t: &Target, bin: &str, local: &Path) -> Result<String, String> {
 pub fn ls(t: &Target, bin: &str, path: &str) -> Result<Value, String> {
     let remote = format!("{bin} ls {}", shq(path));
     let out = run(t.ssh(&remote), "ssh")?;
-    serde_json::from_str(out.trim()).map_err(|e| format!("解析输出失败: {e}"))
+    let json = last_json(&out)
+        .ok_or_else(|| format!("输出里没有 JSON，原样返回: {}", out.trim()))?;
+    serde_json::from_str(json).map_err(|e| format!("解析输出失败: {e}"))
 }
 
 /// Extract on the remote machine; returns its JSON summary.
@@ -168,5 +232,7 @@ pub fn extract(
         remote.push_str(" --skip-existing");
     }
     let stdout = run(t.ssh(&remote), "ssh")?;
-    serde_json::from_str(stdout.trim()).map_err(|e| format!("解析输出失败: {e}"))
+    let json = last_json(&stdout)
+        .ok_or_else(|| format!("输出里没有 JSON，原样返回: {}", stdout.trim()))?;
+    serde_json::from_str(json).map_err(|e| format!("解析输出失败: {e}"))
 }
