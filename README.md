@@ -96,34 +96,43 @@ $ ./resub-linux-x86_64 extract 某集.mkv --out /tmp/out --skip-existing
 ./resub-linux-x86_64 extract /volume1/video --skip-existing
 ```
 
-### 让 Windows 窗口远程控制 NAS
+### 让 Windows 窗口一键驱动 NAS
 
-不想 SSH 敲命令，也不想开浏览器的话：Windows 上的 `resub.exe` 可以直接驱动 NAS 上的
-`resub-linux-x86_64`。两边走的是 `resub serve` 已有的 HTTP 接口，中间只有一个 JSON，
-视频数据不出 NAS。
+Windows 上的 `resub.exe` 可以直接 ssh 到 NAS 上，用那边的一份二进制干活。
+**NAS 上不需要常驻进程、不用开端口，NAS 重启也不影响** —— 每次操作就是一条 ssh 命令，
+NAS 本地读盘、本地写 `.ass`，只把 JSON 结果传回 Windows。
 
-先在 NAS 上把服务挂起来（开机自启就交给任务计划 / systemd）：
+一次性准备（Windows PowerShell，只做一次）：
 
-```sh
-nohup ./resub-linux-x86_64 serve --host 0.0.0.0 --port 8080 --no-open >/dev/null 2>&1 &
+```powershell
+# 1. 生成密钥（已有就跳过）
+ssh-keygen -t ed25519 -N '""' -f $env:USERPROFILE\.ssh\id_ed25519
+
+# 2. 把公钥装到 NAS（会让你输一次密码）
+type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh -p 2222 用户名@192.168.1.10 "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+
+# 3. 验证免密
+ssh -p 2222 用户名@192.168.1.10 "echo ok"
 ```
 
-然后打开 Windows 上的 resub.exe，「抽取 MKV 内嵌字幕」里：
+然后打开 resub.exe，「抽取 MKV 内嵌字幕」里：
 
-1. **NAS 地址** 填 `http://192.168.1.10:8080`，点「连接」看是否通
-2. 点「远程浏览…」——弹出的是 **NAS 上**的目录树，挑到 MKV 所在目录
-3. 点「在 NAS 上抽取」
+1. **NAS 地址** 填 `用户名@192.168.1.10:2222`（端口不是 22 就带上）
+2. **本地程序** 选下载好的 `resub-linux-x86_64`，点「**部署**」——自动 scp 上传、
+   `chmod +x`、验活
+3. 点「**连接**」确认可用
+4. 「**远程浏览…**」列的是 NAS 上的目录；选好路径点「**在 NAS 上抽取**」
 
-窗口里显示的结果（轨道号、语言、条数、zlib 压缩状态）是 NAS 那边算完传回来的，
-抽出来的 `.chs.ass` / `.cht.ass` 也直接落在 NAS 的 MKV 旁边。地址留空就退回本机抽取。
+地址留空 = 本机抽取；填 `http://...` 则退回连一个已经在跑的 `resub serve`。
 
-实测这条链路（本机起服务、走 TCP 回环）：
+部署只需要做一次（升级版本时再做一次）。实测这条链路（用 shim 模拟 ssh/scp 跑通）：
 
 ```
-endpoint = 127.0.0.1:18080
-browse   = 3 files
-fresh    = 2 tracks: [449, 447]
-skip     = 2 tracks, all skipped = true
+probe  -> Ok("me@nas.example 上的 resub 可用")
+ls     -> path=Some("/workspace/downloads") files=3
+extract-> 2 tracks [449, 447]
+skip   -> 2 tracks, all skipped = true
+deploy -> Ok("已上传到 me@nas.example:/tmp/fakeremote/copied")
 ```
 
 ### 浏览器界面（可选）

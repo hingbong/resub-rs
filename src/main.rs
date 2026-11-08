@@ -47,7 +47,8 @@ fn usage() {
 双击 resub.exe 直接打开界面；也可以从命令行使用：
 
 用法:
-  resub extract <文件或目录> [--out 目录] [--track 轨道号] [--skip-existing]
+  resub extract <文件或目录> [--out 目录] [--track 轨道号] [--skip-existing] [--json]
+  resub ls      [目录]                          列出子目录和媒体文件，输出 JSON
   resub plan    --videos <视频目录> --subs <字幕目录> [--suffix .sc] [--mode copy|rename]
   resub apply   --videos <视频目录> --subs <字幕目录> [--suffix .sc] [--mode copy|rename]
   resub gui                                     打开图形界面（原生窗口）
@@ -113,6 +114,7 @@ fn main() -> ExitCode {
     let (named, positional) = flags(&args[1..]);
     match cmd {
         "extract" => cmd_extract(&named, &positional),
+        "ls" => cmd_ls(&positional),
         "gui" => cmd_gui(&named),
         "serve" => cmd_serve(&named),
         "plan" => cmd_plan(&named, false),
@@ -182,7 +184,12 @@ fn cmd_extract(named: &[(String, String)], positional: &[String]) -> ExitCode {
     let only = opt(named, "track").and_then(|v| v.parse::<u64>().ok());
     let out_override = opt(named, "out").map(PathBuf::from);
     let skip_existing = named.iter().any(|(k, _)| k == "skip-existing");
-    let multiple = files.len() > 1;
+    // --json is for a caller on another machine: it cannot read the progress lines,
+    // it wants the tracks back in one piece.
+    let json = named.iter().any(|(k, _)| k == "json");
+    let multiple = files.len() > 1 && !json;
+    let mut json_tracks: Vec<resub::ExtractedTrack> = Vec::new();
+    let mut json_errors: Vec<String> = Vec::new();
 
     let mut written = 0usize;
     let mut skipped = 0usize;
@@ -197,10 +204,16 @@ fn cmd_extract(named: &[(String, String)], positional: &[String]) -> ExitCode {
         match resub::extract_all(file, &out_dir, only, skip_existing) {
             Ok(tracks) => {
                 if tracks.is_empty() {
-                    eprintln!(
-                        "    没有可抽取的文本字幕{}",
-                        if only.is_some() { "（轨道号未命中）" } else { "" }
-                    );
+                    if !json {
+                        eprintln!(
+                            "    没有可抽取的文本字幕{}",
+                            if only.is_some() { "（轨道号未命中）" } else { "" }
+                        );
+                    }
+                    continue;
+                }
+                if json {
+                    json_tracks.extend(tracks);
                     continue;
                 }
                 let here_skipped = tracks.iter().filter(|t| t.skipped).count();
@@ -221,10 +234,22 @@ fn cmd_extract(named: &[(String, String)], positional: &[String]) -> ExitCode {
                 }
             }
             Err(e) => {
-                eprintln!("    失败: {e}");
+                json_errors.push(format!("{}: {e}", file.display()));
+                if !json {
+                    eprintln!("    失败: {e}");
+                }
                 failed += 1;
             }
         }
+    }
+    if json {
+        let v = serde_json::json!({ "tracks": json_tracks, "errors": json_errors });
+        println!("{v}");
+        return if json_errors.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
     }
     println!(
         "完成：{} 个文件，{} 条轨道写出，{} 条已存在跳过，{} 个文件失败",
@@ -237,6 +262,21 @@ fn cmd_extract(named: &[(String, String)], positional: &[String]) -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+fn cmd_ls(positional: &[String]) -> ExitCode {
+    let path = positional.first().map(String::as_str).unwrap_or("");
+    let listing = resub::list_dir(path, true);
+    match serde_json::to_string(&listing) {
+        Ok(s) => {
+            println!("{s}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("序列化失败: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 

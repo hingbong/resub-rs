@@ -7,6 +7,7 @@ pub mod gui;
 pub mod mkv;
 pub mod remote;
 pub mod rename;
+pub mod ssh;
 pub mod server;
 
 use std::collections::HashSet;
@@ -15,7 +16,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-/// A directory listing shared by the native window and the browser UI.
+/// A directory listing shared by the native window, the browser UI and the ssh caller.
+#[derive(Serialize)]
 pub struct DirListing {
     pub path: String,
     pub parent: Option<String>,

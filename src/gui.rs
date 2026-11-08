@@ -176,11 +176,17 @@ struct App {
     extract_progress: String,
     extract_tracks: Vec<crate::ExtractedTrack>,
     extract_errors: Vec<String>,
-    /// "http://nas:8080" to hand the work to the other machine; empty means local.
+    /// "user@nas:2222" to drive the other machine over ssh, or "http://nas:8080" to
+    /// talk to a running resub server. Empty means work locally.
     remote: String,
     remote_status: String,
+    /// Path of the resub binary on the other machine.
+    nas_bin: String,
+    /// Local copy of the Linux binary, uploaded by the deploy button.
+    nas_local: String,
     skip_existing: bool,
     browse: Option<Browse>,
+    job_rx: Option<Receiver<Job>>,
 }
 
 impl Default for App {
@@ -200,8 +206,11 @@ impl Default for App {
             extract_errors: Vec::new(),
             remote: String::new(),
             remote_status: String::new(),
+            nas_bin: "~/resub-linux-x86_64".to_string(),
+            nas_local: guess_local_bin(),
             skip_existing: true,
             browse: None,
+            job_rx: None,
         }
     }
 }
@@ -242,7 +251,8 @@ fn join_path(dir: &str, name: &str) -> String {
     }
 }
 
-/// Directory listing fetched from the remote resub server.
+/// Directory listing fetched from the other machine.
+#[derive(Clone)]
 struct Browse {
     path: String,
     input: String,
@@ -250,6 +260,72 @@ struct Browse {
     dirs: Vec<String>,
     files: Vec<String>,
     error: Option<String>,
+    loading: bool,
+}
+
+impl Browse {
+    fn failed(path: String, error: String) -> Self {
+        Self {
+            input: path.clone(),
+            path,
+            parent: None,
+            dirs: Vec::new(),
+            files: Vec::new(),
+            error: Some(error),
+            loading: false,
+        }
+    }
+
+    fn from_json(v: &Value, fallback: &str) -> Self {
+        let path = v
+            .get("path")
+            .and_then(|x| x.as_str())
+            .unwrap_or(fallback)
+            .to_string();
+        Self {
+            input: path.clone(),
+            path,
+            parent: v.get("parent").and_then(|x| x.as_str()).map(|s| s.to_string()),
+            dirs: names(v, "dirs"),
+            files: names(v, "files"),
+            error: v.get("error").and_then(|x| x.as_str()).map(|s| s.to_string()),
+            loading: false,
+        }
+    }
+}
+
+/// Work handed to a background thread: an ssh round trip is slow enough to be visible.
+enum Job {
+    Browse(Browse),
+    Status(String),
+    Failed(String),
+}
+
+/// Pick any file, no extension filter (the Linux binary has none worth filtering on).
+fn pick_any(title: &str, current: &str) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_title(title);
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        if let Some(parent) = Path::new(trimmed).parent() {
+            if parent.is_dir() {
+                dialog = dialog.set_directory(parent);
+            }
+        }
+    }
+    dialog.pick_file()
+}
+
+/// Look for the Linux binary sitting next to resub.exe, which is where people put it.
+fn guess_local_bin() -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("resub-linux-x86_64");
+            if p.is_file() {
+                return p.to_string_lossy().to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 fn as_string(p: PathBuf) -> String {
@@ -428,7 +504,80 @@ impl App {
         }
     }
 
-    fn test_remote(&mut self) {
+    /// "http://..." means a resub server; anything else is an ssh target.
+    fn is_http(&self) -> bool {
+        self.remote.trim().starts_with("http://")
+    }
+
+    fn ssh_target(&mut self) -> Option<crate::ssh::Target> {
+        match crate::ssh::Target::parse(&self.remote) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                self.remote_status = e;
+                None
+            }
+        }
+    }
+
+    /// Run a blocking round trip off the UI thread and feed the result back.
+    fn spawn_job<F>(&mut self, ctx: &egui::Context, f: F)
+    where
+        F: FnOnce() -> Job + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.job_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_jobs(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.job_rx.take() else {
+            return;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(Job::Browse(b)) => {
+                    self.browse = Some(b);
+                }
+                Ok(Job::Status(s)) => {
+                    self.remote_status = s;
+                    if let Some(st) = self.browse.as_mut() {
+                        st.loading = false;
+                    }
+                }
+                Ok(Job::Failed(e)) => {
+                    self.remote_status = e.clone();
+                    if let Some(st) = self.browse.as_mut() {
+                        st.loading = false;
+                        st.error = Some(e);
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    self.job_rx = Some(rx);
+                    ctx.request_repaint();
+                    return;
+                }
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+    }
+
+    fn test_remote(&mut self, ctx: &egui::Context) {
+        if !self.is_http() {
+            let Some(t) = self.ssh_target() else {
+                return;
+            };
+            let bin = self.nas_bin.trim().to_string();
+            self.remote_status = format!("正在连接 {} …", t.dest());
+            self.spawn_job(ctx, move || match crate::ssh::probe(&t, &bin) {
+                Ok(s) => Job::Status(s),
+                Err(e) => Job::Failed(format!("连接失败: {e}")),
+            });
+            return;
+        }
         let Some(ep) = self.endpoint() else {
             return;
         };
@@ -441,7 +590,87 @@ impl App {
         }
     }
 
+    /// Upload the Linux binary once; afterwards every action is a single ssh call.
+    fn deploy(&mut self, ctx: &egui::Context) {
+        if self.is_http() {
+            self.remote_status = "HTTP 模式不需要部署，服务端已经跑着了".to_string();
+            return;
+        }
+        let Some(t) = self.ssh_target() else {
+            return;
+        };
+        let local = self.nas_local.trim().to_string();
+        if local.is_empty() {
+            self.remote_status = "先选本地那份 resub-linux-x86_64".to_string();
+            return;
+        }
+        let path = PathBuf::from(&local);
+        if !path.is_file() {
+            self.remote_status = format!("找不到: {local}");
+            return;
+        }
+        let bin = self.nas_bin.trim().to_string();
+        if bin.is_empty() {
+            self.remote_status = "远程程序路径不能为空".to_string();
+            return;
+        }
+        self.remote_status = format!("正在上传到 {} …", t.dest());
+        self.spawn_job(ctx, move || match crate::ssh::deploy(&t, &bin, &path) {
+            Ok(s) => Job::Status(s),
+            Err(e) => Job::Failed(format!("部署失败: {e}")),
+        });
+    }
+
+    fn start_ssh_extract(&mut self, ctx: egui::Context, raw: String, out: String, skip: bool) {
+        let Some(t) = self.ssh_target() else {
+            return;
+        };
+        let bin = self.nas_bin.trim().to_string();
+        if bin.is_empty() {
+            self.extract_progress = "远程程序路径不能为空".to_string();
+            return;
+        }
+        self.extract_tracks.clear();
+        self.extract_errors.clear();
+        self.extract_progress = format!("{} 正在处理 {raw}", t.dest());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.extract_rx = Some(rx);
+        std::thread::spawn(move || {
+            match crate::ssh::extract(&t, &bin, &raw, &out, skip) {
+                Ok(v) => {
+                    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+                        let _ = tx.send(Msg::Error(err.to_string()));
+                    } else {
+                        let tracks: Vec<crate::ExtractedTrack> = v
+                            .get("tracks")
+                            .cloned()
+                            .and_then(|t| serde_json::from_value(t).ok())
+                            .unwrap_or_default();
+                        let _ = tx.send(Msg::Tracks(tracks));
+                        if let Some(errs) = v.get("errors").and_then(|e| e.as_array()) {
+                            for e in errs {
+                                let _ = tx.send(Msg::Error(
+                                    e.as_str().unwrap_or_default().to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(e));
+                }
+            }
+            let _ = tx.send(Msg::Finished);
+            ctx.request_repaint();
+        });
+    }
+
     fn start_remote_extract(&mut self, ctx: egui::Context, raw: String, out: String, skip: bool) {
+        if !self.is_http() {
+            self.start_ssh_extract(ctx, raw, out, skip);
+            return;
+        }
         let Some(ep) = self.endpoint() else {
             return;
         };
@@ -481,38 +710,40 @@ impl App {
         });
     }
 
-    fn open_browse(&mut self) {
+    fn open_browse(&mut self, ctx: &egui::Context) {
         let start = self.mkv.trim().to_string();
-        self.load_browse(&start);
+        self.load_browse(ctx, &start);
     }
 
-    fn load_browse(&mut self, path: &str) {
-        let Some(ep) = self.endpoint() else {
+    fn load_browse(&mut self, ctx: &egui::Context, path: &str) {
+        if self.is_http() {
+            let Some(ep) = self.endpoint() else {
+                return;
+            };
+            self.browse = Some(match remote::browse(&ep, path) {
+                Ok(v) => Browse::from_json(&v, path),
+                Err(e) => Browse::failed(path.to_string(), e),
+            });
+            return;
+        }
+
+        let Some(t) = self.ssh_target() else {
             return;
         };
-        let shown = |v: &Value| -> String {
-            v.get("path")
-                .and_then(|x| x.as_str())
-                .unwrap_or(path)
-                .to_string()
-        };
-        self.browse = Some(match remote::browse(&ep, path) {
-            Ok(v) => Browse {
-                path: shown(&v),
-                input: shown(&v),
-                parent: v.get("parent").and_then(|x| x.as_str()).map(|s| s.to_string()),
-                dirs: names(&v, "dirs"),
-                files: names(&v, "files"),
-                error: v.get("error").and_then(|x| x.as_str()).map(|s| s.to_string()),
-            },
-            Err(e) => Browse {
-                path: path.to_string(),
-                input: path.to_string(),
-                parent: None,
-                dirs: Vec::new(),
-                files: Vec::new(),
-                error: Some(e),
-            },
+        let bin = self.nas_bin.trim().to_string();
+        self.browse = Some(Browse {
+            input: path.to_string(),
+            path: path.to_string(),
+            parent: None,
+            dirs: Vec::new(),
+            files: Vec::new(),
+            error: None,
+            loading: true,
+        });
+        let p = path.to_string();
+        self.spawn_job(ctx, move || match crate::ssh::ls(&t, &bin, &p) {
+            Ok(v) => Job::Browse(Browse::from_json(&v, &p)),
+            Err(e) => Job::Failed(e),
         });
     }
 
@@ -548,6 +779,12 @@ impl App {
                         close = true;
                     }
                 });
+                if st.loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("正在连接…");
+                    });
+                }
                 if let Some(e) = &st.error {
                     ui.colored_label(egui::Color32::from_rgb(200, 60, 60), e);
                 }
@@ -576,6 +813,10 @@ impl App {
                     });
             });
 
+        if st.loading {
+            self.browse = Some(st);
+            return;
+        }
         if close {
             self.browse = None;
             return;
@@ -586,7 +827,7 @@ impl App {
             return;
         }
         if let Some(p) = nav {
-            self.load_browse(&p);
+            self.load_browse(ctx, &p);
             return;
         }
         self.browse = Some(st);
@@ -712,6 +953,7 @@ impl App {
         ui.heading("抽取 MKV 内嵌字幕");
         ui.add_space(4.0);
         let remote_mode = !self.remote.trim().is_empty();
+        let http_mode = self.is_http();
         egui::Grid::new("extract_grid")
             .num_columns(3)
             .spacing([8.0, 6.0])
@@ -719,20 +961,48 @@ impl App {
                 ui.label("NAS 地址");
                 ui.add_sized(
                     [560.0, ui.spacing().interact_size.y],
-                    egui::TextEdit::singleline(&mut self.remote)
-                        .hint_text("留空 = 本机抽取；http://192.168.1.10:8080 = 交给 NAS"),
+                    egui::TextEdit::singleline(&mut self.remote).hint_text(
+                        "留空 = 本机；user@192.168.1.10:2222 = ssh 直连，NAS 上不用常驻进程",
+                    ),
                 );
                 ui.horizontal(|ui| {
                     if ui.button("连接").clicked() {
-                        self.test_remote();
+                        self.test_remote(ui.ctx());
                     }
-                    if remote_mode && ui.button("打开网页").clicked() {
+                    if remote_mode && !http_mode && ui.button("部署").clicked() {
+                        self.deploy(ui.ctx());
+                    }
+                    if remote_mode && http_mode && ui.button("打开网页").clicked() {
                         if let Ok(ep) = Endpoint::parse(&self.remote) {
                             crate::server::open_browser(&ep.base_url());
                         }
                     }
                 });
                 ui.end_row();
+
+                if remote_mode && !http_mode {
+                    ui.label("远程程序");
+                    ui.add_sized(
+                        [560.0, ui.spacing().interact_size.y],
+                        egui::TextEdit::singleline(&mut self.nas_bin)
+                            .hint_text("resub 二进制在 NAS 上的路径"),
+                    );
+                    ui.label("");
+                    ui.end_row();
+
+                    ui.label("本地程序");
+                    ui.add_sized(
+                        [560.0, ui.spacing().interact_size.y],
+                        egui::TextEdit::singleline(&mut self.nas_local)
+                            .hint_text("要上传的 resub-linux-x86_64"),
+                    );
+                    if ui.button("选择").clicked() {
+                        if let Some(p) = pick_any("选择 resub-linux-x86_64", &self.nas_local) {
+                            self.nas_local = as_string(p);
+                        }
+                    }
+                    ui.end_row();
+                }
 
                 ui.label("输入");
                 ui.add_sized(
@@ -743,7 +1013,7 @@ impl App {
                 if remote_mode {
                     ui.horizontal(|ui| {
                         if ui.button("远程浏览…").clicked() {
-                            self.open_browse();
+                            self.open_browse(ui.ctx());
                         }
                     });
                 } else {
@@ -847,6 +1117,9 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         if self.extract_rx.is_some() {
             self.poll_extract(&ctx);
+        }
+        if self.job_rx.is_some() {
+            self.poll_jobs(&ctx);
         }
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
