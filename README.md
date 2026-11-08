@@ -109,11 +109,24 @@ NAS 本地读盘、本地写 `.ass`，只把 JSON 结果传回 Windows。
 ssh-keygen -t ed25519 -N '""' -f $env:USERPROFILE\.ssh\id_ed25519
 
 # 2. 把公钥装到 NAS（会让你输一次密码）
-type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh -p 2222 用户名@192.168.1.10 "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+$OutputEncoding = New-Object System.Text.UTF8Encoding $false
+Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub -Raw | ssh -p 2222 用户名@192.168.1.10 "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
 
-# 3. 验证免密
+# 3. 验证免密（不再问密码就对了）
 ssh -p 2222 用户名@192.168.1.10 "echo ok"
 ```
+
+第 3 步如果还在问密码，先看公钥有没有被 BOM 污染：
+
+```sh
+ssh -p 2222 用户名@192.168.1.10 "head -c 3 ~/.ssh/authorized_keys | od -An -tx1"
+```
+
+开头出现 `ef bb bf` 就是 BOM。要说明的是：BOM 不是 `Get-Content` 产生的，而是
+PowerShell 往原生命令的管道里写字节时按 `$OutputEncoding` 编码造成的（5.1 默认是
+ASCII，7+ 默认是无 BOM 的 UTF-8，但只要有人为了治中文乱码把它设成带 BOM 的 UTF-8，
+每次管道都会带上）。所以第 2 步先把 `$OutputEncoding` 显式设了一遍。用 `-Raw`
+读整个文件、而不是逐行读，也能少一层行尾和编码的意外。
 
 然后打开 resub.exe，「抽取 MKV 内嵌字幕」里：
 
