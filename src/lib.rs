@@ -5,13 +5,14 @@ pub mod ebml;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod mkv;
+pub mod remote;
 pub mod rename;
 pub mod server;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 /// A directory listing shared by the native window and the browser UI.
@@ -136,7 +137,7 @@ pub fn collect_mkv(path: &Path) -> Vec<PathBuf> {
     out
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedTrack {
     pub number: u64,
     pub codec: String,

@@ -96,6 +96,36 @@ $ ./resub-linux-x86_64 extract 某集.mkv --out /tmp/out --skip-existing
 ./resub-linux-x86_64 extract /volume1/video --skip-existing
 ```
 
+### 让 Windows 窗口远程控制 NAS
+
+不想 SSH 敲命令，也不想开浏览器的话：Windows 上的 `resub.exe` 可以直接驱动 NAS 上的
+`resub-linux-x86_64`。两边走的是 `resub serve` 已有的 HTTP 接口，中间只有一个 JSON，
+视频数据不出 NAS。
+
+先在 NAS 上把服务挂起来（开机自启就交给任务计划 / systemd）：
+
+```sh
+nohup ./resub-linux-x86_64 serve --host 0.0.0.0 --port 8080 --no-open >/dev/null 2>&1 &
+```
+
+然后打开 Windows 上的 resub.exe，「抽取 MKV 内嵌字幕」里：
+
+1. **NAS 地址** 填 `http://192.168.1.10:8080`，点「连接」看是否通
+2. 点「远程浏览…」——弹出的是 **NAS 上**的目录树，挑到 MKV 所在目录
+3. 点「在 NAS 上抽取」
+
+窗口里显示的结果（轨道号、语言、条数、zlib 压缩状态）是 NAS 那边算完传回来的，
+抽出来的 `.chs.ass` / `.cht.ass` 也直接落在 NAS 的 MKV 旁边。地址留空就退回本机抽取。
+
+实测这条链路（本机起服务、走 TCP 回环）：
+
+```
+endpoint = 127.0.0.1:18080
+browse   = 3 files
+fresh    = 2 tracks: [449, 447]
+skip     = 2 tracks, all skipped = true
+```
+
 ### 浏览器界面（可选）
 
 如果不想用原生窗口，也可以用浏览器当界面：

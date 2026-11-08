@@ -27,6 +27,8 @@ struct ExtractReq {
     file: String,
     #[serde(default)]
     out: String,
+    #[serde(default)]
+    skip_existing: bool,
 }
 
 pub fn run(host: &str, port: u16, open: bool) -> io::Result<()> {
@@ -55,7 +57,7 @@ pub fn run(host: &str, port: u16, open: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn open_browser(url: &str) {
+pub fn open_browser(url: &str) {
     #[cfg(target_os = "windows")]
     {
         let _ = std::process::Command::new("cmd")
@@ -149,7 +151,8 @@ fn handle(mut req: Request) -> io::Result<()> {
         (Method::Get, "/") => reply(req, INDEX_HTML.to_string(), html_header()),
         (Method::Get, "/api/browse") => {
             let p = query_param(&query, "path").unwrap_or_default();
-            reply_json(req, browse(&p))
+            let want_file = query_param(&query, "files").is_some();
+            reply_json(req, browse(&p, want_file))
         }
         (Method::Post, "/api/plan") => {
             let body = read_body(&mut req)?;
@@ -167,8 +170,8 @@ fn handle(mut req: Request) -> io::Result<()> {
     }
 }
 
-fn browse(raw: &str) -> Value {
-    let l = crate::list_dir(raw, false);
+fn browse(raw: &str, want_file: bool) -> Value {
+    let l = crate::list_dir(raw, want_file);
     json!({
         "path": l.path,
         "parent": l.parent,
@@ -215,8 +218,8 @@ fn handle_extract(body: &str) -> Value {
         Err(e) => return json!({ "error": e.to_string() }),
     };
     let file = PathBuf::from(&req.file);
-    if !file.is_file() {
-        return json!({ "error": format!("文件不存在: {}", file.display()) });
+    if !file.exists() {
+        return json!({ "error": format!("路径不存在: {}", file.display()) });
     }
     let out = if req.out.trim().is_empty() {
         file.parent()
@@ -239,7 +242,7 @@ fn handle_extract(body: &str) -> Value {
         } else {
             PathBuf::from(req.out.trim())
         };
-        match crate::extract_all(f, &dir, None, false) {
+        match crate::extract_all(f, &dir, None, req.skip_existing) {
             Ok(mut t) => all.append(&mut t),
             Err(e) => errors.push(format!("{}: {e}", f.display())),
         }

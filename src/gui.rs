@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use eframe::egui;
+use serde_json::Value;
 use walkdir::WalkDir;
 
+use crate::remote::{self, Endpoint};
 use crate::rename::{self, Mode, Status};
 
 /// Look for a Noto Sans family font to use as the primary UI font. Noto is commonly
@@ -174,6 +176,11 @@ struct App {
     extract_progress: String,
     extract_tracks: Vec<crate::ExtractedTrack>,
     extract_errors: Vec<String>,
+    /// "http://nas:8080" to hand the work to the other machine; empty means local.
+    remote: String,
+    remote_status: String,
+    skip_existing: bool,
+    browse: Option<Browse>,
 }
 
 impl Default for App {
@@ -191,6 +198,10 @@ impl Default for App {
             extract_progress: String::new(),
             extract_tracks: Vec::new(),
             extract_errors: Vec::new(),
+            remote: String::new(),
+            remote_status: String::new(),
+            skip_existing: true,
+            browse: None,
         }
     }
 }
@@ -207,6 +218,38 @@ fn status_ui(status: Status) -> (&'static str, egui::Color32) {
 
 fn basename(p: &str) -> &str {
     p.rsplit(['/', '\\']).next().unwrap_or(p)
+}
+
+/// Names out of a JSON array field, tolerating anything unexpected.
+fn names(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(|d| d.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn join_path(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_string()
+    } else if dir.ends_with('/') {
+        format!("{dir}{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// Directory listing fetched from the remote resub server.
+struct Browse {
+    path: String,
+    input: String,
+    parent: Option<String>,
+    dirs: Vec<String>,
+    files: Vec<String>,
+    error: Option<String>,
 }
 
 fn as_string(p: PathBuf) -> String {
@@ -275,6 +318,15 @@ impl App {
         }
         let raw = self.mkv.trim().to_string();
         let out = self.out.trim().to_string();
+        let skip = self.skip_existing;
+
+        // Remote: one request. The other machine walks its own disk, so nothing is
+        // pulled across the network.
+        if !self.remote.trim().is_empty() {
+            self.start_remote_extract(ctx, raw, out, skip);
+            return;
+        }
+
         let path = PathBuf::from(&raw);
         if !path.exists() {
             self.extract_progress = format!("路径不存在: {raw}");
@@ -310,7 +362,7 @@ impl App {
                 } else {
                     PathBuf::from(&out)
                 };
-                match crate::extract_all(file, &out_dir, None, false) {
+                match crate::extract_all(file, &out_dir, None, skip) {
                     Ok(tracks) => {
                         let _ = tx.send(Msg::Tracks(tracks));
                     }
@@ -361,6 +413,183 @@ impl App {
             self.extract_rx = Some(rx);
             ctx.request_repaint();
         }
+    }
+
+    fn endpoint(&mut self) -> Option<Endpoint> {
+        match Endpoint::parse(&self.remote) {
+            Ok(ep) => {
+                self.remote_status.clear();
+                Some(ep)
+            }
+            Err(e) => {
+                self.remote_status = e;
+                None
+            }
+        }
+    }
+
+    fn test_remote(&mut self) {
+        let Some(ep) = self.endpoint() else {
+            return;
+        };
+        match remote::browse(&ep, "") {
+            Ok(v) => {
+                let n = names(&v, "dirs").len();
+                self.remote_status = format!("已连接 {}（{} 个入口）", ep.label(), n);
+            }
+            Err(e) => self.remote_status = format!("连接失败: {e}"),
+        }
+    }
+
+    fn start_remote_extract(&mut self, ctx: egui::Context, raw: String, out: String, skip: bool) {
+        let Some(ep) = self.endpoint() else {
+            return;
+        };
+        self.extract_tracks.clear();
+        self.extract_errors.clear();
+        self.extract_progress = format!("{} 正在处理 {raw}", ep.label());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.extract_rx = Some(rx);
+        std::thread::spawn(move || {
+            match remote::extract(&ep, &raw, &out, skip) {
+                Ok(v) => {
+                    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+                        let _ = tx.send(Msg::Error(err.to_string()));
+                    } else {
+                        let tracks: Vec<crate::ExtractedTrack> = v
+                            .get("tracks")
+                            .cloned()
+                            .and_then(|t| serde_json::from_value(t).ok())
+                            .unwrap_or_default();
+                        let _ = tx.send(Msg::Tracks(tracks));
+                        if let Some(errs) = v.get("errors").and_then(|e| e.as_array()) {
+                            for e in errs {
+                                let _ = tx.send(Msg::Error(
+                                    e.as_str().unwrap_or_default().to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(e));
+                }
+            }
+            let _ = tx.send(Msg::Finished);
+            ctx.request_repaint();
+        });
+    }
+
+    fn open_browse(&mut self) {
+        let start = self.mkv.trim().to_string();
+        self.load_browse(&start);
+    }
+
+    fn load_browse(&mut self, path: &str) {
+        let Some(ep) = self.endpoint() else {
+            return;
+        };
+        let shown = |v: &Value| -> String {
+            v.get("path")
+                .and_then(|x| x.as_str())
+                .unwrap_or(path)
+                .to_string()
+        };
+        self.browse = Some(match remote::browse(&ep, path) {
+            Ok(v) => Browse {
+                path: shown(&v),
+                input: shown(&v),
+                parent: v.get("parent").and_then(|x| x.as_str()).map(|s| s.to_string()),
+                dirs: names(&v, "dirs"),
+                files: names(&v, "files"),
+                error: v.get("error").and_then(|x| x.as_str()).map(|s| s.to_string()),
+            },
+            Err(e) => Browse {
+                path: path.to_string(),
+                input: path.to_string(),
+                parent: None,
+                dirs: Vec::new(),
+                files: Vec::new(),
+                error: Some(e),
+            },
+        });
+    }
+
+    fn browse_window(&mut self, ctx: &egui::Context) {
+        let Some(mut st) = self.browse.take() else {
+            return;
+        };
+        let mut nav: Option<String> = None;
+        let mut pick: Option<String> = None;
+        let mut close = false;
+        egui::Window::new("远程目录")
+            .default_width(680.0)
+            .default_height(480.0)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("↑ 上级").clicked() {
+                        if let Some(p) = st.parent.clone() {
+                            nav = Some(p);
+                        }
+                    }
+                    if ui.button("刷新").clicked() {
+                        nav = Some(st.path.clone());
+                    }
+                    ui.add_sized(
+                        [380.0, ui.spacing().interact_size.y],
+                        egui::TextEdit::singleline(&mut st.input),
+                    );
+                    if ui.button("转到").clicked() {
+                        nav = Some(st.input.clone());
+                    }
+                    if ui.button("关闭").clicked() {
+                        close = true;
+                    }
+                });
+                if let Some(e) = &st.error {
+                    ui.colored_label(egui::Color32::from_rgb(200, 60, 60), e);
+                }
+                let cur = if st.path.is_empty() {
+                    "/".to_string()
+                } else {
+                    st.path.clone()
+                };
+                ui.label(format!("当前: {cur}"));
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("remote_browse")
+                    .max_height(360.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for d in &st.dirs {
+                            if ui.button(format!("[目录] {d}")).clicked() {
+                                nav = Some(join_path(&st.path, d));
+                            }
+                        }
+                        for f in &st.files {
+                            if ui.button(format!("[文件] {f}")).clicked() {
+                                pick = Some(join_path(&st.path, f));
+                            }
+                        }
+                    });
+            });
+
+        if close {
+            self.browse = None;
+            return;
+        }
+        if let Some(p) = pick {
+            self.mkv = p;
+            self.browse = None;
+            return;
+        }
+        if let Some(p) = nav {
+            self.load_browse(&p);
+            return;
+        }
+        self.browse = Some(st);
     }
 
     fn section_rename(&mut self, ui: &mut egui::Ui) {
@@ -482,28 +711,55 @@ impl App {
     fn section_extract(&mut self, ui: &mut egui::Ui) {
         ui.heading("抽取 MKV 内嵌字幕");
         ui.add_space(4.0);
+        let remote_mode = !self.remote.trim().is_empty();
         egui::Grid::new("extract_grid")
             .num_columns(3)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
+                ui.label("NAS 地址");
+                ui.add_sized(
+                    [560.0, ui.spacing().interact_size.y],
+                    egui::TextEdit::singleline(&mut self.remote)
+                        .hint_text("留空 = 本机抽取；http://192.168.1.10:8080 = 交给 NAS"),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("连接").clicked() {
+                        self.test_remote();
+                    }
+                    if remote_mode && ui.button("打开网页").clicked() {
+                        if let Ok(ep) = Endpoint::parse(&self.remote) {
+                            crate::server::open_browser(&ep.base_url());
+                        }
+                    }
+                });
+                ui.end_row();
+
                 ui.label("输入");
                 ui.add_sized(
                     [560.0, ui.spacing().interact_size.y],
                     egui::TextEdit::singleline(&mut self.mkv)
                         .hint_text("单个 .mkv，或包含 MKV 的目录（会递归）"),
                 );
-                ui.horizontal(|ui| {
-                    if ui.button("选文件").clicked() {
-                        if let Some(p) = pick_file("选择 MKV 文件", &self.mkv) {
-                            self.mkv = as_string(p);
+                if remote_mode {
+                    ui.horizontal(|ui| {
+                        if ui.button("远程浏览…").clicked() {
+                            self.open_browse();
                         }
-                    }
-                    if ui.button("选目录").clicked() {
-                        if let Some(p) = pick_folder("选择包含 MKV 的目录", &self.mkv) {
-                            self.mkv = as_string(p);
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        if ui.button("选文件").clicked() {
+                            if let Some(p) = pick_file("选择 MKV 文件", &self.mkv) {
+                                self.mkv = as_string(p);
+                            }
                         }
-                    }
-                });
+                        if ui.button("选目录").clicked() {
+                            if let Some(p) = pick_folder("选择包含 MKV 的目录", &self.mkv) {
+                                self.mkv = as_string(p);
+                            }
+                        }
+                    });
+                }
                 ui.end_row();
 
                 ui.label("输出目录");
@@ -512,7 +768,9 @@ impl App {
                     egui::TextEdit::singleline(&mut self.out)
                         .hint_text("留空 = 每个 MKV 旁边"),
                 );
-                if ui.button("浏览").clicked() {
+                if remote_mode {
+                    ui.label("");
+                } else if ui.button("浏览").clicked() {
                     if let Some(p) = pick_folder("选择输出目录", &self.out) {
                         self.out = as_string(p);
                     }
@@ -520,15 +778,22 @@ impl App {
                 ui.end_row();
             });
 
+        if !self.remote_status.is_empty() {
+            ui.add_space(2.0);
+            ui.label(&self.remote_status);
+        }
+
         let busy = self.extract_rx.is_some();
         ui.horizontal(|ui| {
-            if ui.add_enabled(!busy, egui::Button::new("抽取")).clicked() {
+            let label = if remote_mode { "在 NAS 上抽取" } else { "抽取" };
+            if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
                 let ctx = ui.ctx().clone();
                 self.start_extract(ctx);
             }
             if busy {
                 ui.spinner();
             }
+            ui.checkbox(&mut self.skip_existing, "跳过已存在的字幕");
             if !self.extract_progress.is_empty() {
                 ui.label(&self.extract_progress);
             }
@@ -564,7 +829,11 @@ impl App {
                                     None => "未压缩",
                                 };
                                 ui.label(comp);
-                                ui.label(format!("{} 条", t.events));
+                                if t.skipped {
+                                    ui.label("已存在");
+                                } else {
+                                    ui.label(format!("{} 条", t.events));
+                                }
                                 ui.end_row();
                             }
                         });
@@ -594,5 +863,6 @@ impl eframe::App for App {
                     ui.add_space(14.0);
                 });
         });
+        self.browse_window(&ctx);
     }
 }
