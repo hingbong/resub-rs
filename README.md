@@ -134,7 +134,7 @@ ASCII，7+ 默认是无 BOM 的 UTF-8，但只要有人为了治中文乱码把�
    端口可以省略：地址里不写端口时 resub **不传 `-p`**，让 ssh 自己读 `~/.ssh/config`。
    所以已经配过 `Host nas` / `Port 2222` / `User yukine` 的话，这里直接填 `nas` 就行。
 2. **本地程序** 可以留空。留空时「部署」会先用 `curl` 从 nightly 拉一份
-   `resub-linux-x86_64` 到临时目录，再 scp 上去。
+   `resub-linux-x86_64` 到临时目录，再传上去。
 3. 点「**部署**」—— 上传 + `chmod +x` + 验活，一步完成（升级版本再点一次）。
 4. 点「**连接**」确认可用。没部署过会直接告诉你「还没有 resub，先点部署」，
    而不是甩一句 `No such file or directory`。
@@ -145,14 +145,20 @@ ASCII，7+ 默认是无 BOM 的 UTF-8，但只要有人为了治中文乱码把�
 
 地址留空 = 本机抽取；填 `http://...` 则退回连一个已经在跑的 `resub serve`。
 
-部署只需要做一次（升级版本时再做一次）。实测这条链路（用 shim 模拟 ssh/scp 跑通）：
+部署只需要做一次（升级版本时再做一次）。
+
+上传**不走 scp**：OpenSSH 9 起 scp 默认改用 SFTP 协议，而群晖这类 NAS 的 sshd 通常没配
+`Subsystem sftp`，会直接报 `subsystem request failed on channel 0`。resub 改成用普通
+ssh 会话的 stdin 写过去（`cat > 目标路径`），只要 ssh 能登录就不需要服务端任何开关，
+传完再比对字节数和试跑一次。实测这条链路（用 shim 模拟 ssh 跑通）：
 
 ```
 probe  -> Ok("me@nas.example 上的 resub 可用")
 ls     -> path=Some("/workspace/downloads") files=3
 extract-> 2 tracks [449, 447]
 skip   -> 2 tracks, all skipped = true
-deploy -> Ok("已上传到 me@nas.example:/tmp/fakeremote/copied")
+deploy -> Ok("已上传到 yukine@nas.example:/tmp/fakeremote/deployed（32293040 字节）")
+          传完的 sha256 与本地一致
 ```
 
 ### 浏览器界面（可选）

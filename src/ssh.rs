@@ -1,4 +1,4 @@
-//! Drive a resub binary on another machine by shelling out to the system ssh/scp.
+//! Drive a resub binary on another machine by shelling out to the system ssh.
 //!
 //! Windows 10 1809+ and every Linux ship OpenSSH, so this needs no new dependency and
 //! no daemon on the other side: each action is a single ssh invocation that prints JSON
@@ -79,7 +79,6 @@ impl Target {
             c.arg(o);
         }
         c.arg(self.dest()).arg(remote);
-        c.stdin(Stdio::null());
         quiet(&mut c);
         c
     }
@@ -102,9 +101,13 @@ fn shq(s: &str) -> String {
 }
 
 fn run(mut cmd: Command, what: &str) -> Result<String, String> {
+    // Spelling the argv out on failure is the difference between a report someone can
+    // act on and "it did not work".
+    let shown = format!("{cmd:?}");
+    cmd.stdin(Stdio::null());
     let out = cmd
         .output()
-        .map_err(|e| format!("无法执行 {what}: {e}（系统里没有这个命令？）"))?;
+        .map_err(|e| format!("无法执行 {what}: {e}（系统里没有这个命令？）\n命令: {shown}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     if !out.status.success() {
@@ -114,9 +117,9 @@ fn run(mut cmd: Command, what: &str) -> Result<String, String> {
             stderr.trim().to_string()
         };
         return Err(if msg.is_empty() {
-            format!("{what} 退出码 {}", out.status.code().unwrap_or(-1))
+            format!("{what} 退出码 {}\n命令: {shown}", out.status.code().unwrap_or(-1))
         } else {
-            msg
+            format!("{msg}\n命令: {shown}")
         });
     }
     Ok(stdout)
@@ -189,22 +192,79 @@ pub const LINUX_ASSET_URL: &str =
     "https://github.com/hingbong/resub-rs/releases/download/nightly/resub-linux-x86_64";
 
 /// Copy the local Linux binary over and make it executable.
+///
+/// Deliberately not scp: OpenSSH 9 made scp speak SFTP first, and a NAS sshd normally
+/// has no sftp subsystem enabled, which fails with "subsystem request failed". The
+/// shell is always there, so the bytes go through stdin of a plain ssh session.
 pub fn deploy(t: &Target, bin: &str, local: &Path) -> Result<String, String> {
-    let mut c = Command::new("scp");
-    if let Some(p) = t.port {
-        c.arg("-P").arg(p.to_string());
-    }
-    for o in t.options() {
-        c.arg(o);
-    }
-    c.arg(local).arg(format!("{}:{bin}", t.dest()));
-    c.stdin(Stdio::null());
-    quiet(&mut c);
-    run(c, "scp")?;
+    let size = std::fs::metadata(local)
+        .map_err(|e| format!("读取 {} 失败: {e}", local.display()))?
+        .len();
 
-    let remote = format!("chmod +x {bin} && {bin} --help >/dev/null && echo ok");
-    run(t.ssh(&remote), "ssh")?;
-    Ok(format!("已上传到 {}:{bin}", t.dest()))
+    let mut c = t.ssh(&format!("cat > {bin}"));
+    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = c
+        .spawn()
+        .map_err(|e| format!("无法执行 ssh: {e}（系统里没有 ssh？）"))?;
+    // If the remote side dies first (unwritable path, full disk) our write breaks with
+    // a bare EPIPE, which says nothing useful. Keep going, collect its stderr and let
+    // that speak instead.
+    let mut copy_err = None;
+    {
+        let mut file = std::fs::File::open(local)
+            .map_err(|e| format!("读取 {} 失败: {e}", local.display()))?;
+        match child.stdin.take() {
+            Some(mut sink) => {
+                if let Err(e) = std::io::copy(&mut file, &mut sink) {
+                    copy_err = Some(format!("传输中断: {e}"));
+                }
+            }
+            None => copy_err = Some("拿不到 ssh 的标准输入".to_string()),
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("等待 ssh 结束失败: {e}"))?;
+    let err = String::from_utf8_lossy(&out.stderr);
+    let err = err
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some(e) = copy_err {
+        return Err(if err.is_empty() {
+            e
+        } else {
+            format!("{e}\n远程: {err}")
+        });
+    }
+    if !out.status.success() {
+        return Err(if err.is_empty() {
+            format!("写入 {bin} 失败，退出码 {}", out.status.code().unwrap_or(-1))
+        } else {
+            err
+        });
+    }
+
+    // Byte count is the cheapest proof the stream arrived intact.
+    let remote = format!(
+        "chmod +x {bin} 2>/dev/null; S=$(wc -c < {bin} 2>/dev/null); \
+         if [ \"$S\" != \"{size}\" ]; then echo RESUB_SIZE; \
+         elif {bin} --help >/dev/null 2>&1; then echo RESUB_OK; else echo RESUB_BROKEN; fi"
+    );
+    let check = run(t.ssh(&remote), "ssh")?;
+    if check.contains("RESUB_SIZE") {
+        return Err(format!(
+            "传上去的字节数不对（本地 {size} 字节）。可能是连接中断，重试一次。"
+        ));
+    }
+    if check.contains("RESUB_BROKEN") {
+        return Err(format!("{bin} 传上去了但跑不起来，可能是架构不对。"));
+    }
+    if !check.contains("RESUB_OK") {
+        return Err(format!("部署后自检没有通过，原样返回: {}", check.trim()));
+    }
+    Ok(format!("已上传到 {}:{bin}（{size} 字节）", t.dest()))
 }
 
 /// Directory listing, in the same shape the HTTP route returns.
