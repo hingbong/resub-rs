@@ -1,6 +1,7 @@
 //! resub: batch subtitle renamer and Matroska subtitle extractor.
 
 pub mod ass;
+pub mod config;
 pub mod ebml;
 #[cfg(feature = "gui")]
 pub mod gui;

@@ -171,6 +171,23 @@ pub fn probe(t: &Target, bin: &str) -> Result<String, String> {
     }
 }
 
+/// A single round trip that answers "why can it not list /volume1" without guessing:
+/// who we are, where home is, what the permissions look like, and whether the binary runs.
+pub fn diagnose(t: &Target, bin: &str) -> Result<String, String> {
+    let remote = format!(
+        "echo \"user=$(id -un 2>/dev/null || echo '?')\"; \
+         echo \"home=$HOME\"; \
+         echo '--- ls -ld $HOME ---'; ls -ld \"$HOME\" 2>&1; \
+         echo '--- ls -ld /volume1 ---'; ls -ld /volume1 2>&1; \
+         echo '--- ls /volume1 ---'; ls -l /volume1 2>&1 | head -20; \
+         echo '--- ls -l {bin} ---'; ls -l {bin} 2>&1; \
+         echo '--- run ---'; {bin} --help 2>&1 | head -3; \
+         exit 0"
+    );
+    let out = run(t.ssh(&remote), "ssh")?;
+    Ok(out)
+}
+
 /// Fetch the x86_64 Linux build into a local path. Uses curl, which ships with
 /// Windows 10 1803+ and with virtually every Linux.
 pub fn fetch_binary(dest: &std::path::Path) -> Result<(), String> {

@@ -187,31 +187,54 @@ struct App {
     skip_existing: bool,
     browse: Option<Browse>,
     job_rx: Option<Receiver<Job>>,
+    /// Where the remote browser was last time, so it reopens there.
+    remote_dir: String,
+    diag: Option<String>,
+    /// Serialised form of everything worth keeping; compared against the live state.
+    saved: String,
+    dirty_since: Option<std::time::Instant>,
 }
 
 impl Default for App {
     fn default() -> Self {
-        Self {
+        let cfg = crate::config::Config::load();
+        let nas_bin = if cfg.nas_bin.trim().is_empty() {
+            "~/resub-linux-x86_64".to_string()
+        } else {
+            cfg.nas_bin
+        };
+        let nas_local = if cfg.nas_local.trim().is_empty() {
+            guess_local_bin()
+        } else {
+            cfg.nas_local
+        };
+        let mut app = Self {
             videos: String::new(),
             subs: String::new(),
             suffix: ".chs".to_string(),
             mode: Mode::Copy,
             plan: None,
             message: String::new(),
-            mkv: String::new(),
-            out: String::new(),
+            mkv: cfg.mkv,
+            out: cfg.out,
             extract_rx: None,
             extract_progress: String::new(),
             extract_tracks: Vec::new(),
             extract_errors: Vec::new(),
-            remote: String::new(),
+            remote: cfg.remote,
             remote_status: String::new(),
-            nas_bin: "~/resub-linux-x86_64".to_string(),
-            nas_local: guess_local_bin(),
-            skip_existing: true,
+            nas_bin,
+            nas_local,
+            skip_existing: cfg.skip_existing,
             browse: None,
             job_rx: None,
-        }
+            remote_dir: cfg.remote_dir,
+            diag: None,
+            saved: String::new(),
+            dirty_since: None,
+        };
+        app.saved = app.snapshot();
+        app
     }
 }
 
@@ -301,6 +324,7 @@ enum Job {
     /// Deployment finished; remembers where the binary came from so the next one
     /// does not download it again.
     Deployed { local: String, msg: String },
+    Diag(String),
     Failed(String),
 }
 
@@ -507,6 +531,50 @@ impl App {
         }
     }
 
+    /// Everything worth keeping, in one comparable string.
+    fn snapshot(&self) -> String {
+        format!(
+            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+            self.remote,
+            self.nas_bin,
+            self.nas_local,
+            self.skip_existing,
+            self.mkv,
+            self.out,
+            self.remote_dir
+        )
+    }
+
+    fn save_config(&self) {
+        let cfg = crate::config::Config {
+            remote: self.remote.clone(),
+            nas_bin: self.nas_bin.clone(),
+            nas_local: self.nas_local.clone(),
+            skip_existing: self.skip_existing,
+            mkv: self.mkv.clone(),
+            out: self.out.clone(),
+            remote_dir: self.remote_dir.clone(),
+        };
+        cfg.save();
+    }
+
+    /// Write the settings out once the user stops fiddling, not on every keystroke.
+    fn persist(&mut self, ctx: &egui::Context) {
+        let now = self.snapshot();
+        if now != self.saved {
+            self.saved = now;
+            self.dirty_since = Some(std::time::Instant::now());
+        }
+        if let Some(t) = self.dirty_since {
+            if t.elapsed() >= std::time::Duration::from_millis(600) {
+                self.dirty_since = None;
+                self.save_config();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+
     /// "http://..." means a resub server; anything else is an ssh target.
     fn is_http(&self) -> bool {
         self.remote.trim().starts_with("http://")
@@ -543,7 +611,12 @@ impl App {
         loop {
             match rx.try_recv() {
                 Ok(Job::Browse(b)) => {
+                    self.remote_dir = b.path.clone();
                     self.browse = Some(b);
+                }
+                Ok(Job::Diag(t)) => {
+                    self.remote_status.clear();
+                    self.diag = Some(t);
                 }
                 Ok(Job::Status(s)) => {
                     self.remote_status = s;
@@ -740,8 +813,35 @@ impl App {
         });
     }
 
+    /// One round trip that prints who we are, what the paths look like and whether the
+    /// binary runs, so "cannot list /volume1" can be answered instead of guessed at.
+    fn diagnose(&mut self, ctx: &egui::Context) {
+        if self.is_http() {
+            self.remote_status = "HTTP 模式下服务端在跑就说明连得上，没有额外诊断".to_string();
+            return;
+        }
+        let Some(t) = self.ssh_target() else {
+            return;
+        };
+        let bin = self.nas_bin.trim().to_string();
+        self.remote_status = "正在收集远端信息…".to_string();
+        self.spawn_job(ctx, move || match crate::ssh::diagnose(&t, &bin) {
+            Ok(s) => Job::Diag(s),
+            Err(e) => Job::Failed(format!("诊断失败: {e}")),
+        });
+    }
+
     fn open_browse(&mut self, ctx: &egui::Context) {
-        let start = self.mkv.trim().to_string();
+        let typed = self.mkv.trim().to_string();
+        // A Windows path left over from local mode means nothing on the other machine.
+        let looks_remote = typed.starts_with('/') && !typed.contains('\\');
+        let start = if looks_remote {
+            typed
+        } else if !self.remote_dir.trim().is_empty() {
+            self.remote_dir.clone()
+        } else {
+            String::new()
+        };
         self.load_browse(ctx, &start);
     }
 
@@ -750,10 +850,12 @@ impl App {
             let Some(ep) = self.endpoint() else {
                 return;
             };
-            self.browse = Some(match remote::browse(&ep, path) {
+            let b = match remote::browse(&ep, path) {
                 Ok(v) => Browse::from_json(&v, path),
                 Err(e) => Browse::failed(path.to_string(), e),
-            });
+            };
+            self.remote_dir = b.path.clone();
+            self.browse = Some(b);
             return;
         }
 
@@ -799,44 +901,83 @@ impl App {
                         nav = Some(st.path.clone());
                     }
                     ui.add_sized(
-                        [380.0, ui.spacing().interact_size.y],
+                        [330.0, ui.spacing().interact_size.y],
                         egui::TextEdit::singleline(&mut st.input),
                     );
                     if ui.button("转到").clicked() {
                         nav = Some(st.input.clone());
                     }
+                    if ui
+                        .button("✓ 用这个目录")
+                        .on_hover_text("把当前所在的目录整个作为抽取输入")
+                        .clicked()
+                    {
+                        pick = Some(st.path.clone());
+                    }
                     if ui.button("关闭").clicked() {
                         close = true;
                     }
                 });
+
                 if st.loading {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label("正在连接…");
                     });
                 }
-                if let Some(e) = &st.error {
-                    ui.colored_label(egui::Color32::from_rgb(200, 60, 60), e);
-                }
+
                 let cur = if st.path.is_empty() {
                     "/".to_string()
                 } else {
                     st.path.clone()
                 };
                 ui.label(format!("当前: {cur}"));
+                if let Some(e) = &st.error {
+                    ui.colored_label(egui::Color32::from_rgb(200, 60, 60), e);
+                }
+                ui.label(format!(
+                    "{} 个子目录 · {} 个视频/字幕文件",
+                    st.dirs.len(),
+                    st.files.len()
+                ));
                 ui.separator();
+
                 egui::ScrollArea::vertical()
                     .id_salt("remote_browse")
                     .max_height(360.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        if !st.loading && st.dirs.is_empty() && st.files.is_empty() {
+                            ui.weak(if st.error.is_some() {
+                                "这个目录读不出来，具体原因见上面的红字。"
+                            } else {
+                                "这个目录是空的，或者里面没有视频/字幕文件。"
+                            });
+                        }
                         for d in &st.dirs {
-                            if ui.button(format!("[目录] {d}")).clicked() {
-                                nav = Some(join_path(&st.path, d));
-                            }
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(false, format!("DIR  {d}"))
+                                    .on_hover_text("点击进入这个目录")
+                                    .clicked()
+                                {
+                                    nav = Some(join_path(&st.path, d));
+                                }
+                                if ui
+                                    .small_button("选这个目录")
+                                    .on_hover_text("直接把整个目录作为输入，不用再进去")
+                                    .clicked()
+                                {
+                                    pick = Some(join_path(&st.path, d));
+                                }
+                            });
                         }
                         for f in &st.files {
-                            if ui.button(format!("[文件] {f}")).clicked() {
+                            if ui
+                                .selectable_label(false, format!("FILE {f}"))
+                                .on_hover_text("点击选用这个文件")
+                                .clicked()
+                            {
                                 pick = Some(join_path(&st.path, f));
                             }
                         }
@@ -861,6 +1002,31 @@ impl App {
             return;
         }
         self.browse = Some(st);
+    }
+
+    fn diag_window(&mut self, ctx: &egui::Context) {
+        let Some(text) = self.diag.clone() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("远端诊断")
+            .default_width(760.0)
+            .default_height(400.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("这些是在 NAS 上执行命令的真实输出，可以直接复制。");
+                ui.separator();
+                egui::ScrollArea::both()
+                    .id_salt("diag_scroll")
+                    .max_height(330.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.monospace(&text);
+                    });
+            });
+        if !open {
+            self.diag = None;
+        }
     }
 
     fn section_rename(&mut self, ui: &mut egui::Ui) {
@@ -1001,6 +1167,9 @@ impl App {
                     }
                     if remote_mode && !http_mode && ui.button("部署").clicked() {
                         self.deploy(ui.ctx());
+                    }
+                    if remote_mode && !http_mode && ui.button("诊断").clicked() {
+                        self.diagnose(ui.ctx());
                     }
                     if remote_mode && http_mode && ui.button("打开网页").clicked() {
                         if let Ok(ep) = Endpoint::parse(&self.remote) {
@@ -1167,5 +1336,7 @@ impl eframe::App for App {
                 });
         });
         self.browse_window(&ctx);
+        self.diag_window(&ctx);
+        self.persist(&ctx);
     }
 }
